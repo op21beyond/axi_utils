@@ -271,7 +271,6 @@ module lbus_srps #(
     output wire [8:0]                   ssrp_hwrite,
     output wire [9*3-1:0]               ssrp_hsize,
     output wire [9*3-1:0]               ssrp_hburst,
-    output wire [9*4-1:0]               ssrp_hprot,
     output wire [9*DATA_WIDTH_32-1:0]  ssrp_hwdata,
     input  wire [9*DATA_WIDTH_32-1:0]   ssrp_hrdata,
     input  wire [8:0]                   ssrp_hready,
@@ -1093,7 +1092,7 @@ module lbus_srps #(
         .s_rid(mext_rt_rid), .s_rdata(mext_rt_rdata), .s_rresp(mext_rt_rresp),
         .s_rlast(mext_rt_rlast),
         .haddr(ssrp_haddr), .htrans(ssrp_htrans), .hwrite(ssrp_hwrite),
-        .hsize(ssrp_hsize), .hburst(ssrp_hburst), .hprot(ssrp_hprot),
+        .hsize(ssrp_hsize), .hburst(ssrp_hburst),
         .hwdata(ssrp_hwdata), .hrdata(ssrp_hrdata),
         .hready(ssrp_hready), .hresp(ssrp_hresp)
     );

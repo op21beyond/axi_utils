@@ -76,7 +76,6 @@ module lbus_plt #(
     output wire [NUM_SREG-1:0]            sreg_hwrite,
     output wire [NUM_SREG*3-1:0]          sreg_hsize,
     output wire [NUM_SREG*3-1:0]          sreg_hburst,
-    output wire [NUM_SREG*4-1:0]          sreg_hprot,
     output wire [NUM_SREG*DATA_WIDTH-1:0] sreg_hwdata,
     input  wire [NUM_SREG*DATA_WIDTH-1:0] sreg_hrdata,
     input  wire [NUM_SREG-1:0]            sreg_hready,
@@ -130,7 +129,6 @@ module lbus_plt #(
     output wire [NUM_SMEM-1:0]            smem_hwrite,
     output wire [NUM_SMEM*3-1:0]          smem_hsize,
     output wire [NUM_SMEM*3-1:0]          smem_hburst,
-    output wire [NUM_SMEM*4-1:0]          smem_hprot,
     output wire [NUM_SMEM*DATA_WIDTH-1:0] smem_hwdata,
     input  wire [NUM_SMEM*DATA_WIDTH-1:0] smem_hrdata,
     input  wire [NUM_SMEM-1:0]            smem_hready,
@@ -271,7 +269,7 @@ module lbus_plt #(
         .s_rvalid(rt0_rvalid), .s_rready(rt0_rready),
         .s_rid(rt0_rid), .s_rdata(rt0_rdata), .s_rresp(rt0_rresp), .s_rlast(rt0_rlast),
         .haddr(sreg_haddr), .htrans(sreg_htrans), .hwrite(sreg_hwrite),
-        .hsize(sreg_hsize), .hburst(sreg_hburst), .hprot(sreg_hprot),
+        .hsize(sreg_hsize), .hburst(sreg_hburst),
         .hwdata(sreg_hwdata), .hrdata(sreg_hrdata),
         .hready(sreg_hready), .hresp(sreg_hresp)
     );
@@ -306,7 +304,7 @@ module lbus_plt #(
         .s_rvalid(rt1_rvalid), .s_rready(rt1_rready),
         .s_rid(rt1_rid), .s_rdata(rt1_rdata), .s_rresp(rt1_rresp), .s_rlast(rt1_rlast),
         .haddr(smem_haddr), .htrans(smem_htrans), .hwrite(smem_hwrite),
-        .hsize(smem_hsize), .hburst(smem_hburst), .hprot(smem_hprot),
+        .hsize(smem_hsize), .hburst(smem_hburst),
         .hwdata(smem_hwdata), .hrdata(smem_hrdata),
         .hready(smem_hready), .hresp(smem_hresp)
     );

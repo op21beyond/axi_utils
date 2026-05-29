@@ -75,7 +75,6 @@ module axi3_router_1toN_ahblite #(
     output wire [N-1:0]                 hwrite,
     output wire [N*3-1:0]               hsize,
     output wire [N*3-1:0]               hburst,
-    output wire [N*4-1:0]               hprot,
     output wire [N*DATA_WIDTH-1:0]      hwdata,
     input  wire [N*DATA_WIDTH-1:0]      hrdata,
     input  wire [N-1:0]                 hready,
@@ -213,8 +212,6 @@ module axi3_router_1toN_ahblite #(
         for (i = 0; i < N; i = i + 1) begin : g_ahb_bridge
             axi3_to_ahblite #(
                 .ADDR_WIDTH(ADDR_WIDTH),
-                .DATA_WIDTH(DATA_WIDTH),
-                .STRB_WIDTH(STRB_WIDTH),
                 .WR_CMD_DEPTH(WR_CMD_DEPTH),
                 .RD_CMD_DEPTH(RD_CMD_DEPTH),
                 .RESP_DEPTH(RESP_DEPTH),
@@ -258,7 +255,6 @@ module axi3_router_1toN_ahblite #(
                 .hwrite(hwrite[i]),
                 .hsize(hsize[(i*3) +: 3]),
                 .hburst(hburst[(i*3) +: 3]),
-                .hprot(hprot[(i*4) +: 4]),
                 .hwdata(hwdata[(i*DATA_WIDTH) +: DATA_WIDTH]),
                 .hrdata(hrdata[(i*DATA_WIDTH) +: DATA_WIDTH]),
                 .hready(hready[i]),
