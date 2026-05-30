@@ -1,369 +1,367 @@
 // -----------------------------------------------------------------------------
 // Module      : lbus_srps
 // Date        : 2026-05-28
-// Version     : v1.0.0
+// Version     : v1.1.0
 // Author      : Jongchul Shin
-// Function    : SRPS local bus interconnect top.
-//               9x AXI3 128-bit slave (msrp0~8) -> 1:2 router -> merge -> sext*.
-//               1x AXI3 32-bit slave (mext0) -> router/AHB -> 9x AHB-Lite (ssrp0~8).
-// Assumptions : aw_sel/ar_sel are provided externally per port (one-hot).
-//               Register slices are placed on sext* and mext0 boundaries.
-// Notes       : msrp index i corresponds to msrp<i> port.
+// Function    : SRPS local bus interconnect top (9 fixed SRP instances).
+//               msrp[0..8] -> 1:2 router -> merge/bypass -> sextmem (packed).
+//               msrp[0..8] target1 -> io 9:1 merge -> sextio.
+//               mext -> router/AHB -> ssrp[0..8] (packed).
+// Assumptions : msrp target select (mem vs io) is decoded from msrp AW/AR address.
+//               mext AHB target select is decoded from mext AW/AR address.
+//               Per-msrp axi3_aw_w_order_gate enforces AW-before-W at input.
+//               Register slices on sext* (128-bit wrap) and per-channel on mext.
+// Caution     : msrp mem/io split is hard-coded to 0xE000_0000..0xFFFF_FFFF -> sextio;
+//               all other msrp addresses -> sextmem. If the system map changes,
+//               axi3_msrp_io_region_sel.v must be updated (no runtime parameter).
+// Notes       : MSRP_MERGE_CFG selects SRP0~7 merge geometry; SRP8 always bypasses
+//               to sextmem[SEXTMEM_PORT_NUM-1]. ADDR_WIDTH_M (msrp/sext*) and
+//               ADDR_WIDTH_S (mext/ssrp) may differ. Unused mext address bits are
+//               zeroed at input (addr_map) and at the router (addr_tgt).
+//               ssrp AHB outputs SINGLE transfers only (hburst=000; htrans=IDLE/NONSEQ).
+//               mext AW-before-W is enforced by axi3_router_1toN write ordering FIFO
+//               (w_fifo_empty gates s_wready); no gate on mext.
 // -----------------------------------------------------------------------------
 module lbus_srps #(
-    parameter integer MSR_ID_WIDTH       = 4,              // msrp AXI ID width
-    parameter integer MEXT_ID_WIDTH      = 4,              // mext0 AXI ID width
-    parameter integer ADDR_WIDTH         = 32,             // Address width
-    parameter integer DATA_WIDTH_128     = 128,            // msrp/sext data width
-    parameter integer DATA_WIDTH_32      = 32,             // mext data width
-    parameter integer HADDR_LOW_BITS     = 32,             // AHB haddr output mask width
-    parameter integer ROUTER_OUTSTANDING   = 16,           // mext router outstanding depth
+    parameter integer MSRP_MERGE_CFG   = 2,              // 1=8:1, 2=4:1x2, 3=2:1x4
+    parameter integer SEXTMEM_PORT_NUM   = (1 << (MSRP_MERGE_CFG - 1)) + 1,
+    parameter integer MSRP_ID_WIDTH      = 5,              // per-SRP msrp slave AXI ID width
+    parameter integer IO_MERGE_TAG_W     = 4,              // io 9:1: source index msrp[0..8]
+    parameter integer SEXTMEM_ID_WIDTH   = MSRP_ID_WIDTH +
+        ((MSRP_MERGE_CFG == 1) ? 3 : (MSRP_MERGE_CFG == 2) ? 2 : 1), // packed sextmem bus
+    parameter integer SEXTIO_ID_WIDTH    = MSRP_ID_WIDTH + IO_MERGE_TAG_W, // sextio after io 9:1
+    parameter integer MEXT_ID_WIDTH      = 4,              // mext AXI ID width
+    parameter integer ADDR_WIDTH_M       = 35,             // msrp/sextmem/sextio address width
+    parameter integer ADDR_WIDTH_S       = 32,             // mext/ssrp address width
+    parameter integer ROUTER_OUTSTANDING = 32,           // mext router outstanding depth
     parameter integer WR_CMD_DEPTH       = 16,             // AHB bridge write command depth
     parameter integer RD_CMD_DEPTH       = 16,             // AHB bridge read command depth
     parameter integer RESP_DEPTH         = 8,              // AHB bridge response depth
-    parameter         BUSY_ENABLE        = 1'b1,           // AHB bridge BUSY enable
-    parameter         SEXT_SLICE_EN      = 1'b1,           // Register slice on sext* ports
-    parameter         MEXT_SLICE_EN      = 1'b1            // Register slice on mext0 port
+    parameter integer AHB_REGION_SIZE_KB = 4,              // Equal ssrp AHB slot size (kilobytes)
+    parameter integer MSRP_WR_PENDING_DEPTH = 16,          // msrp AW-before-W pending depth per port
+    parameter         SEXT_AW_SLICE_EN   = 1'b1,           // sextmem/sextio AW register slice
+    parameter         SEXT_W_SLICE_EN    = 1'b1,           // sextmem/sextio W register slice
+    parameter         SEXT_B_SLICE_EN    = 1'b1,           // sextmem/sextio B register slice
+    parameter         SEXT_AR_SLICE_EN   = 1'b1,           // sextmem/sextio AR register slice
+    parameter         SEXT_R_SLICE_EN    = 1'b1,           // sextmem/sextio R register slice
+    parameter         MEXT_AW_SLICE_EN   = 1'b1,           // mext AW register slice
+    parameter         MEXT_W_SLICE_EN    = 1'b1,           // mext W register slice
+    parameter         MEXT_B_SLICE_EN    = 1'b1,           // mext B register slice
+    parameter         MEXT_AR_SLICE_EN   = 1'b1,           // mext AR register slice
+    parameter         MEXT_R_SLICE_EN    = 1'b1            // mext R register slice
 ) (
     input  wire                         aclk,
     input  wire                         aresetn,
 
-    // msrp0~8: AXI3 128-bit slave (index 0..8)
+    // msrp[0..8]: AXI3 128-bit slave (one per SRP AXI master)
     input  wire [8:0]                   msrp_awvalid,
     output wire [8:0]                   msrp_awready,
-    input  wire [8*MSR_ID_WIDTH-1:0]    msrp_awid,
-    input  wire [8*ADDR_WIDTH-1:0]      msrp_awaddr,
-    input  wire [8*4-1:0]               msrp_awlen,
-    input  wire [8*3-1:0]               msrp_awsize,
-    input  wire [8*2-1:0]               msrp_awburst,
-    input  wire [8*2-1:0]               msrp_awlock,
-    input  wire [8*4-1:0]               msrp_awcache,
-    input  wire [8*3-1:0]               msrp_awprot,
-    input  wire [8*2-1:0]               msrp_aw_sel,
+    input  wire [9*MSRP_ID_WIDTH-1:0]   msrp_awid,
+    input  wire [9*ADDR_WIDTH_M-1:0]     msrp_awaddr,
+    input  wire [9*4-1:0]              msrp_awlen,
+    input  wire [9*3-1:0]              msrp_awsize,
+    input  wire [9*2-1:0]              msrp_awburst,
+    input  wire [9*2-1:0]              msrp_awlock,
+    input  wire [9*4-1:0]              msrp_awcache,
+    input  wire [9*3-1:0]              msrp_awprot,
 
     input  wire [8:0]                   msrp_wvalid,
     output wire [8:0]                   msrp_wready,
-    input  wire [8*MSR_ID_WIDTH-1:0]    msrp_wid,
-    input  wire [8*DATA_WIDTH_128-1:0]  msrp_wdata,
-    input  wire [8*(DATA_WIDTH_128/8)-1:0] msrp_wstrb,
+    input  wire [9*MSRP_ID_WIDTH-1:0]   msrp_wid,
+    input  wire [9*128-1:0]            msrp_wdata,
+    input  wire [9*16-1:0]             msrp_wstrb,
     input  wire [8:0]                   msrp_wlast,
 
     output wire [8:0]                   msrp_bvalid,
     input  wire [8:0]                   msrp_bready,
-    output wire [8*MSR_ID_WIDTH-1:0]    msrp_bid,
-    output wire [8*2-1:0]               msrp_bresp,
+    output wire [9*MSRP_ID_WIDTH-1:0]   msrp_bid,
+    output wire [9*2-1:0]              msrp_bresp,
 
     input  wire [8:0]                   msrp_arvalid,
     output wire [8:0]                   msrp_arready,
-    input  wire [8*MSR_ID_WIDTH-1:0]    msrp_arid,
-    input  wire [8*ADDR_WIDTH-1:0]      msrp_araddr,
-    input  wire [8*4-1:0]               msrp_arlen,
-    input  wire [8*3-1:0]               msrp_arsize,
-    input  wire [8*2-1:0]               msrp_arburst,
-    input  wire [8*2-1:0]               msrp_arlock,
-    input  wire [8*4-1:0]               msrp_arcache,
-    input  wire [8*3-1:0]               msrp_arprot,
-    input  wire [8*2-1:0]               msrp_ar_sel,
+    input  wire [9*MSRP_ID_WIDTH-1:0]   msrp_arid,
+    input  wire [9*ADDR_WIDTH_M-1:0]     msrp_araddr,
+    input  wire [9*4-1:0]              msrp_arlen,
+    input  wire [9*3-1:0]              msrp_arsize,
+    input  wire [9*2-1:0]              msrp_arburst,
+    input  wire [9*2-1:0]              msrp_arlock,
+    input  wire [9*4-1:0]              msrp_arcache,
+    input  wire [9*3-1:0]              msrp_arprot,
 
     output wire [8:0]                   msrp_rvalid,
     input  wire [8:0]                   msrp_rready,
-    output wire [8*MSR_ID_WIDTH-1:0]    msrp_rid,
-    output wire [8*DATA_WIDTH_128-1:0]  msrp_rdata,
-    output wire [8*2-1:0]               msrp_rresp,
+    output wire [9*MSRP_ID_WIDTH-1:0]   msrp_rid,
+    output wire [9*128-1:0]            msrp_rdata,
+    output wire [9*2-1:0]              msrp_rresp,
     output wire [8:0]                   msrp_rlast,
 
-    // sextmem0~2, sextio0: AXI3 128-bit master
-    output wire                         sextmem0_awvalid,
-    input  wire                         sextmem0_awready,
-    output wire [MSR_ID_WIDTH+2-1:0]    sextmem0_awid,
-    output wire [ADDR_WIDTH-1:0]        sextmem0_awaddr,
-    output wire [3:0]                   sextmem0_awlen,
-    output wire [2:0]                   sextmem0_awsize,
-    output wire [1:0]                   sextmem0_awburst,
-    output wire [1:0]                   sextmem0_awlock,
-    output wire [3:0]                   sextmem0_awcache,
-    output wire [2:0]                   sextmem0_awprot,
+    // sextmem[0..SEXTMEM_PORT_NUM-1]: AXI3 128-bit master (packed)
+    output wire [SEXTMEM_PORT_NUM-1:0]              sextmem_awvalid,
+    input  wire [SEXTMEM_PORT_NUM-1:0]              sextmem_awready,
+    output wire [SEXTMEM_PORT_NUM*SEXTMEM_ID_WIDTH-1:0] sextmem_awid,
+    output wire [SEXTMEM_PORT_NUM*ADDR_WIDTH_M-1:0]   sextmem_awaddr,
+    output wire [SEXTMEM_PORT_NUM*4-1:0]            sextmem_awlen,
+    output wire [SEXTMEM_PORT_NUM*3-1:0]            sextmem_awsize,
+    output wire [SEXTMEM_PORT_NUM*2-1:0]            sextmem_awburst,
+    output wire [SEXTMEM_PORT_NUM*2-1:0]            sextmem_awlock,
+    output wire [SEXTMEM_PORT_NUM*4-1:0]            sextmem_awcache,
+    output wire [SEXTMEM_PORT_NUM*3-1:0]            sextmem_awprot,
 
-    output wire                         sextmem0_wvalid,
-    input  wire                         sextmem0_wready,
-    output wire [MSR_ID_WIDTH+2-1:0]    sextmem0_wid,
-    output wire [DATA_WIDTH_128-1:0]    sextmem0_wdata,
-    output wire [DATA_WIDTH_128/8-1:0]  sextmem0_wstrb,
-    output wire                         sextmem0_wlast,
+    output wire [SEXTMEM_PORT_NUM-1:0]              sextmem_wvalid,
+    input  wire [SEXTMEM_PORT_NUM-1:0]              sextmem_wready,
+    output wire [SEXTMEM_PORT_NUM*SEXTMEM_ID_WIDTH-1:0] sextmem_wid,
+    output wire [SEXTMEM_PORT_NUM*128-1:0]          sextmem_wdata,
+    output wire [SEXTMEM_PORT_NUM*16-1:0]           sextmem_wstrb,
+    output wire [SEXTMEM_PORT_NUM-1:0]              sextmem_wlast,
 
-    input  wire                         sextmem0_bvalid,
-    output wire                         sextmem0_bready,
-    input  wire [MSR_ID_WIDTH+2-1:0]    sextmem0_bid,
-    input  wire [1:0]                   sextmem0_bresp,
+    input  wire [SEXTMEM_PORT_NUM-1:0]              sextmem_bvalid,
+    output wire [SEXTMEM_PORT_NUM-1:0]              sextmem_bready,
+    input  wire [SEXTMEM_PORT_NUM*SEXTMEM_ID_WIDTH-1:0] sextmem_bid,
+    input  wire [SEXTMEM_PORT_NUM*2-1:0]            sextmem_bresp,
 
-    output wire                         sextmem0_arvalid,
-    input  wire                         sextmem0_arready,
-    output wire [MSR_ID_WIDTH+2-1:0]    sextmem0_arid,
-    output wire [ADDR_WIDTH-1:0]        sextmem0_araddr,
-    output wire [3:0]                   sextmem0_arlen,
-    output wire [2:0]                   sextmem0_arsize,
-    output wire [1:0]                   sextmem0_arburst,
-    output wire [1:0]                   sextmem0_arlock,
-    output wire [3:0]                   sextmem0_arcache,
-    output wire [2:0]                   sextmem0_arprot,
+    output wire [SEXTMEM_PORT_NUM-1:0]              sextmem_arvalid,
+    input  wire [SEXTMEM_PORT_NUM-1:0]              sextmem_arready,
+    output wire [SEXTMEM_PORT_NUM*SEXTMEM_ID_WIDTH-1:0] sextmem_arid,
+    output wire [SEXTMEM_PORT_NUM*ADDR_WIDTH_M-1:0]   sextmem_araddr,
+    output wire [SEXTMEM_PORT_NUM*4-1:0]            sextmem_arlen,
+    output wire [SEXTMEM_PORT_NUM*3-1:0]            sextmem_arsize,
+    output wire [SEXTMEM_PORT_NUM*2-1:0]            sextmem_arburst,
+    output wire [SEXTMEM_PORT_NUM*2-1:0]            sextmem_arlock,
+    output wire [SEXTMEM_PORT_NUM*4-1:0]            sextmem_arcache,
+    output wire [SEXTMEM_PORT_NUM*3-1:0]            sextmem_arprot,
 
-    input  wire                         sextmem0_rvalid,
-    output wire                         sextmem0_rready,
-    input  wire [MSR_ID_WIDTH+2-1:0]    sextmem0_rid,
-    input  wire [DATA_WIDTH_128-1:0]    sextmem0_rdata,
-    input  wire [1:0]                   sextmem0_rresp,
-    input  wire                         sextmem0_rlast,
+    input  wire [SEXTMEM_PORT_NUM-1:0]              sextmem_rvalid,
+    output wire [SEXTMEM_PORT_NUM-1:0]              sextmem_rready,
+    input  wire [SEXTMEM_PORT_NUM*SEXTMEM_ID_WIDTH-1:0] sextmem_rid,
+    input  wire [SEXTMEM_PORT_NUM*128-1:0]          sextmem_rdata,
+    input  wire [SEXTMEM_PORT_NUM*2-1:0]            sextmem_rresp,
+    input  wire [SEXTMEM_PORT_NUM-1:0]              sextmem_rlast,
 
-    output wire                         sextmem1_awvalid,
-    input  wire                         sextmem1_awready,
-    output wire [MSR_ID_WIDTH+2-1:0]    sextmem1_awid,
-    output wire [ADDR_WIDTH-1:0]        sextmem1_awaddr,
-    output wire [3:0]                   sextmem1_awlen,
-    output wire [2:0]                   sextmem1_awsize,
-    output wire [1:0]                   sextmem1_awburst,
-    output wire [1:0]                   sextmem1_awlock,
-    output wire [3:0]                   sextmem1_awcache,
-    output wire [2:0]                   sextmem1_awprot,
-    output wire                         sextmem1_wvalid,
-    input  wire                         sextmem1_wready,
-    output wire [MSR_ID_WIDTH+2-1:0]    sextmem1_wid,
-    output wire [DATA_WIDTH_128-1:0]    sextmem1_wdata,
-    output wire [DATA_WIDTH_128/8-1:0]  sextmem1_wstrb,
-    output wire                         sextmem1_wlast,
-    input  wire                         sextmem1_bvalid,
-    output wire                         sextmem1_bready,
-    input  wire [MSR_ID_WIDTH+2-1:0]    sextmem1_bid,
-    input  wire [1:0]                   sextmem1_bresp,
-    output wire                         sextmem1_arvalid,
-    input  wire                         sextmem1_arready,
-    output wire [MSR_ID_WIDTH+2-1:0]    sextmem1_arid,
-    output wire [ADDR_WIDTH-1:0]        sextmem1_araddr,
-    output wire [3:0]                   sextmem1_arlen,
-    output wire [2:0]                   sextmem1_arsize,
-    output wire [1:0]                   sextmem1_arburst,
-    output wire [1:0]                   sextmem1_arlock,
-    output wire [3:0]                   sextmem1_arcache,
-    output wire [2:0]                   sextmem1_arprot,
-    input  wire                         sextmem1_rvalid,
-    output wire                         sextmem1_rready,
-    input  wire [MSR_ID_WIDTH+2-1:0]    sextmem1_rid,
-    input  wire [DATA_WIDTH_128-1:0]    sextmem1_rdata,
-    input  wire [1:0]                   sextmem1_rresp,
-    input  wire                         sextmem1_rlast,
+    // sextio: AXI3 128-bit master (target1 io 9:1)
+    output wire                         sextio_awvalid,
+    input  wire                         sextio_awready,
+    output wire [SEXTIO_ID_WIDTH-1:0]   sextio_awid,
+    output wire [ADDR_WIDTH_M-1:0]        sextio_awaddr,
+    output wire [3:0]                   sextio_awlen,
+    output wire [2:0]                   sextio_awsize,
+    output wire [1:0]                   sextio_awburst,
+    output wire [1:0]                   sextio_awlock,
+    output wire [3:0]                   sextio_awcache,
+    output wire [2:0]                   sextio_awprot,
 
-    output wire                         sextmem2_awvalid,
-    input  wire                         sextmem2_awready,
-    output wire [MSR_ID_WIDTH-1:0]      sextmem2_awid,
-    output wire [ADDR_WIDTH-1:0]        sextmem2_awaddr,
-    output wire [3:0]                   sextmem2_awlen,
-    output wire [2:0]                   sextmem2_awsize,
-    output wire [1:0]                   sextmem2_awburst,
-    output wire [1:0]                   sextmem2_awlock,
-    output wire [3:0]                   sextmem2_awcache,
-    output wire [2:0]                   sextmem2_awprot,
-    output wire                         sextmem2_wvalid,
-    input  wire                         sextmem2_wready,
-    output wire [MSR_ID_WIDTH-1:0]      sextmem2_wid,
-    output wire [DATA_WIDTH_128-1:0]    sextmem2_wdata,
-    output wire [DATA_WIDTH_128/8-1:0]  sextmem2_wstrb,
-    output wire                         sextmem2_wlast,
-    input  wire                         sextmem2_bvalid,
-    output wire                         sextmem2_bready,
-    input  wire [MSR_ID_WIDTH-1:0]      sextmem2_bid,
-    input  wire [1:0]                   sextmem2_bresp,
-    output wire                         sextmem2_arvalid,
-    input  wire                         sextmem2_arready,
-    output wire [MSR_ID_WIDTH-1:0]      sextmem2_arid,
-    output wire [ADDR_WIDTH-1:0]        sextmem2_araddr,
-    output wire [3:0]                   sextmem2_arlen,
-    output wire [2:0]                   sextmem2_arsize,
-    output wire [1:0]                   sextmem2_arburst,
-    output wire [1:0]                   sextmem2_arlock,
-    output wire [3:0]                   sextmem2_arcache,
-    output wire [2:0]                   sextmem2_arprot,
-    input  wire                         sextmem2_rvalid,
-    output wire                         sextmem2_rready,
-    input  wire [MSR_ID_WIDTH-1:0]      sextmem2_rid,
-    input  wire [DATA_WIDTH_128-1:0]    sextmem2_rdata,
-    input  wire [1:0]                   sextmem2_rresp,
-    input  wire                         sextmem2_rlast,
+    output wire                         sextio_wvalid,
+    input  wire                         sextio_wready,
+    output wire [SEXTIO_ID_WIDTH-1:0]   sextio_wid,
+    output wire [127:0]                 sextio_wdata,
+    output wire [15:0]                  sextio_wstrb,
+    output wire                         sextio_wlast,
 
-    output wire                         sextio0_awvalid,
-    input  wire                         sextio0_awready,
-    output wire [MSR_ID_WIDTH+4-1:0]    sextio0_awid,
-    output wire [ADDR_WIDTH-1:0]        sextio0_awaddr,
-    output wire [3:0]                   sextio0_awlen,
-    output wire [2:0]                   sextio0_awsize,
-    output wire [1:0]                   sextio0_awburst,
-    output wire [1:0]                   sextio0_awlock,
-    output wire [3:0]                   sextio0_awcache,
-    output wire [2:0]                   sextio0_awprot,
-    output wire                         sextio0_wvalid,
-    input  wire                         sextio0_wready,
-    output wire [MSR_ID_WIDTH+4-1:0]    sextio0_wid,
-    output wire [DATA_WIDTH_128-1:0]    sextio0_wdata,
-    output wire [DATA_WIDTH_128/8-1:0]  sextio0_wstrb,
-    output wire                         sextio0_wlast,
-    input  wire                         sextio0_bvalid,
-    output wire                         sextio0_bready,
-    input  wire [MSR_ID_WIDTH+4-1:0]    sextio0_bid,
-    input  wire [1:0]                   sextio0_bresp,
-    output wire                         sextio0_arvalid,
-    input  wire                         sextio0_arready,
-    output wire [MSR_ID_WIDTH+4-1:0]    sextio0_arid,
-    output wire [ADDR_WIDTH-1:0]        sextio0_araddr,
-    output wire [3:0]                   sextio0_arlen,
-    output wire [2:0]                   sextio0_arsize,
-    output wire [1:0]                   sextio0_arburst,
-    output wire [1:0]                   sextio0_arlock,
-    output wire [3:0]                   sextio0_arcache,
-    output wire [2:0]                   sextio0_arprot,
-    input  wire                         sextio0_rvalid,
-    output wire                         sextio0_rready,
-    input  wire [MSR_ID_WIDTH+4-1:0]    sextio0_rid,
-    input  wire [DATA_WIDTH_128-1:0]    sextio0_rdata,
-    input  wire [1:0]                   sextio0_rresp,
-    input  wire                         sextio0_rlast,
+    input  wire                         sextio_bvalid,
+    output wire                         sextio_bready,
+    input  wire [SEXTIO_ID_WIDTH-1:0]   sextio_bid,
+    input  wire [1:0]                   sextio_bresp,
 
-    // mext0: AXI3 32-bit slave
-    input  wire                         mext0_awvalid,
-    output wire                         mext0_awready,
-    input  wire [MEXT_ID_WIDTH-1:0]     mext0_awid,
-    input  wire [ADDR_WIDTH-1:0]       mext0_awaddr,
-    input  wire [3:0]                   mext0_awlen,
-    input  wire [2:0]                   mext0_awsize,
-    input  wire [1:0]                   mext0_awburst,
-    input  wire [1:0]                   mext0_awlock,
-    input  wire [3:0]                   mext0_awcache,
-    input  wire [2:0]                   mext0_awprot,
-    input  wire [8:0]                   mext0_aw_sel,
-    input  wire                         mext0_wvalid,
-    output wire                         mext0_wready,
-    input  wire [MEXT_ID_WIDTH-1:0]     mext0_wid,
-    input  wire [DATA_WIDTH_32-1:0]    mext0_wdata,
-    input  wire [DATA_WIDTH_32/8-1:0]  mext0_wstrb,
-    input  wire                         mext0_wlast,
-    output wire                         mext0_bvalid,
-    input  wire                         mext0_bready,
-    output wire [MEXT_ID_WIDTH-1:0]     mext0_bid,
-    output wire [1:0]                   mext0_bresp,
-    input  wire                         mext0_arvalid,
-    output wire                         mext0_arready,
-    input  wire [MEXT_ID_WIDTH-1:0]     mext0_arid,
-    input  wire [ADDR_WIDTH-1:0]       mext0_araddr,
-    input  wire [3:0]                   mext0_arlen,
-    input  wire [2:0]                   mext0_arsize,
-    input  wire [1:0]                   mext0_arburst,
-    input  wire [1:0]                   mext0_arlock,
-    input  wire [3:0]                   mext0_arcache,
-    input  wire [2:0]                   mext0_arprot,
-    input  wire [8:0]                   mext0_ar_sel,
-    output wire                         mext0_rvalid,
-    input  wire                         mext0_rready,
-    output wire [MEXT_ID_WIDTH-1:0]     mext0_rid,
-    output wire [DATA_WIDTH_32-1:0]    mext0_rdata,
-    output wire [1:0]                   mext0_rresp,
-    output wire                         mext0_rlast,
+    output wire                         sextio_arvalid,
+    input  wire                         sextio_arready,
+    output wire [SEXTIO_ID_WIDTH-1:0]   sextio_arid,
+    output wire [ADDR_WIDTH_M-1:0]        sextio_araddr,
+    output wire [3:0]                   sextio_arlen,
+    output wire [2:0]                   sextio_arsize,
+    output wire [1:0]                   sextio_arburst,
+    output wire [1:0]                   sextio_arlock,
+    output wire [3:0]                   sextio_arcache,
+    output wire [2:0]                   sextio_arprot,
 
-    // ssrp0~8: AHB-Lite master (index 0..8)
-    output wire [9*ADDR_WIDTH-1:0]      ssrp_haddr,
+    input  wire                         sextio_rvalid,
+    output wire                         sextio_rready,
+    input  wire [SEXTIO_ID_WIDTH-1:0]   sextio_rid,
+    input  wire [127:0]                 sextio_rdata,
+    input  wire [1:0]                   sextio_rresp,
+    input  wire                         sextio_rlast,
+
+    // mext: AXI3 32-bit slave
+    input  wire                         mext_awvalid,
+    output wire                         mext_awready,
+    input  wire [MEXT_ID_WIDTH-1:0]     mext_awid,
+    input  wire [ADDR_WIDTH_S-1:0]       mext_awaddr,
+    input  wire [3:0]                   mext_awlen,
+    input  wire [2:0]                   mext_awsize,
+    input  wire [1:0]                   mext_awburst,
+    input  wire [1:0]                   mext_awlock,
+    input  wire [3:0]                   mext_awcache,
+    input  wire [2:0]                   mext_awprot,
+    input  wire                         mext_wvalid,
+    output wire                         mext_wready,
+    input  wire [MEXT_ID_WIDTH-1:0]     mext_wid,
+    input  wire [31:0]                  mext_wdata,
+    input  wire [3:0]                   mext_wstrb,
+    input  wire                         mext_wlast,
+    output wire                         mext_bvalid,
+    input  wire                         mext_bready,
+    output wire [MEXT_ID_WIDTH-1:0]     mext_bid,
+    output wire [1:0]                   mext_bresp,
+    input  wire                         mext_arvalid,
+    output wire                         mext_arready,
+    input  wire [MEXT_ID_WIDTH-1:0]     mext_arid,
+    input  wire [ADDR_WIDTH_S-1:0]       mext_araddr,
+    input  wire [3:0]                   mext_arlen,
+    input  wire [2:0]                   mext_arsize,
+    input  wire [1:0]                   mext_arburst,
+    input  wire [1:0]                   mext_arlock,
+    input  wire [3:0]                   mext_arcache,
+    input  wire [2:0]                   mext_arprot,
+    output wire                         mext_rvalid,
+    input  wire                         mext_rready,
+    output wire [MEXT_ID_WIDTH-1:0]     mext_rid,
+    output wire [31:0]                  mext_rdata,
+    output wire [1:0]                   mext_rresp,
+    output wire                         mext_rlast,
+
+    // ssrp[0..8]: AHB-Lite master (one per SRP AHB slave)
+    output wire [9*ADDR_WIDTH_S-1:0]      ssrp_haddr,
     output wire [9*2-1:0]               ssrp_htrans,
     output wire [8:0]                   ssrp_hwrite,
     output wire [9*3-1:0]               ssrp_hsize,
     output wire [9*3-1:0]               ssrp_hburst,
-    output wire [9*DATA_WIDTH_32-1:0]  ssrp_hwdata,
-    input  wire [9*DATA_WIDTH_32-1:0]   ssrp_hrdata,
+    output wire [9*32-1:0]              ssrp_hwdata,
+    input  wire [9*32-1:0]              ssrp_hrdata,
     input  wire [8:0]                   ssrp_hready,
     input  wire [8:0]                   ssrp_hresp
 );
 
-    localparam integer STRB_W128 = DATA_WIDTH_128 / 8;
-    localparam integer STRB_W32  = DATA_WIDTH_32 / 8;
-    localparam integer MEM01_ID_W = MSR_ID_WIDTH + 2;
-    localparam integer IO_ID_W    = MSR_ID_WIDTH + 4;
+    localparam integer NUM_SRP            = 9;
+    localparam integer SRP_LAST           = 8;
+    localparam integer NUM_MEM_MERGE      = (1 << (MSRP_MERGE_CFG - 1)); // mem merge instance count
+    localparam integer MEM_MERGE_N        = 8 / NUM_MEM_MERGE;           // inputs per mem merge
+    localparam integer MEM_MERGE_TAG_W    =
+        (MSRP_MERGE_CFG == 1) ? 3 : (MSRP_MERGE_CFG == 2) ? 2 : 1;
+    localparam integer MEM_MERGE_ID_W     = MSRP_ID_WIDTH + MEM_MERGE_TAG_W;
+    localparam integer BYPASS_IDX         = SEXTMEM_PORT_NUM - 1; // msrp[8] bypass -> sextmem[BYPASS_IDX]
+    localparam integer SEXTMEM_ID_PAD_W   = SEXTMEM_ID_WIDTH - MEM_MERGE_ID_W; // zero-pad to SEXTMEM_ID_WIDTH
+    localparam integer SEXTMEM_BYPASS_PAD_W = SEXTMEM_ID_WIDTH - MSRP_ID_WIDTH; // msrp[8] bypass -> sextmem[BYPASS_IDX]
 
     // Router master target0/target1 arrays
     wire [8:0]                   rt0_awvalid;
     wire [8:0]                   rt0_awready;
-    wire [8*MSR_ID_WIDTH-1:0]    rt0_awid;
-    wire [8*ADDR_WIDTH-1:0]      rt0_awaddr;
-    wire [8*4-1:0]               rt0_awlen;
-    wire [8*3-1:0]               rt0_awsize;
-    wire [8*2-1:0]               rt0_awburst;
-    wire [8*2-1:0]               rt0_awlock;
-    wire [8*4-1:0]               rt0_awcache;
-    wire [8*3-1:0]               rt0_awprot;
+    wire [9*MSRP_ID_WIDTH-1:0]   rt0_awid;
+    wire [9*ADDR_WIDTH_M-1:0]      rt0_awaddr;
+    wire [9*4-1:0]               rt0_awlen;
+    wire [9*3-1:0]               rt0_awsize;
+    wire [9*2-1:0]               rt0_awburst;
+    wire [9*2-1:0]               rt0_awlock;
+    wire [9*4-1:0]               rt0_awcache;
+    wire [9*3-1:0]               rt0_awprot;
     wire [8:0]                   rt0_wvalid;
     wire [8:0]                   rt0_wready;
-    wire [8*MSR_ID_WIDTH-1:0]    rt0_wid;
-    wire [8*DATA_WIDTH_128-1:0]  rt0_wdata;
-    wire [8*STRB_W128-1:0]       rt0_wstrb;
+    wire [9*MSRP_ID_WIDTH-1:0]   rt0_wid;
+    wire [9*128-1:0]             rt0_wdata;
+    wire [9*16-1:0]              rt0_wstrb;
     wire [8:0]                   rt0_wlast;
     wire [8:0]                   rt0_bvalid;
     wire [8:0]                   rt0_bready;
-    wire [8*MSR_ID_WIDTH-1:0]    rt0_bid;
-    wire [8*2-1:0]               rt0_bresp;
+    wire [9*MSRP_ID_WIDTH-1:0]   rt0_bid;
+    wire [9*2-1:0]               rt0_bresp;
     wire [8:0]                   rt0_arvalid;
     wire [8:0]                   rt0_arready;
-    wire [8*MSR_ID_WIDTH-1:0]    rt0_arid;
-    wire [8*ADDR_WIDTH-1:0]      rt0_araddr;
-    wire [8*4-1:0]               rt0_arlen;
-    wire [8*3-1:0]               rt0_arsize;
-    wire [8*2-1:0]               rt0_arburst;
-    wire [8*2-1:0]               rt0_arlock;
-    wire [8*4-1:0]               rt0_arcache;
-    wire [8*3-1:0]               rt0_arprot;
+    wire [9*MSRP_ID_WIDTH-1:0]   rt0_arid;
+    wire [9*ADDR_WIDTH_M-1:0]      rt0_araddr;
+    wire [9*4-1:0]               rt0_arlen;
+    wire [9*3-1:0]               rt0_arsize;
+    wire [9*2-1:0]               rt0_arburst;
+    wire [9*2-1:0]               rt0_arlock;
+    wire [9*4-1:0]               rt0_arcache;
+    wire [9*3-1:0]               rt0_arprot;
     wire [8:0]                   rt0_rvalid;
     wire [8:0]                   rt0_rready;
-    wire [8*MSR_ID_WIDTH-1:0]    rt0_rid;
-    wire [8*DATA_WIDTH_128-1:0]  rt0_rdata;
-    wire [8*2-1:0]               rt0_rresp;
+    wire [9*MSRP_ID_WIDTH-1:0]   rt0_rid;
+    wire [9*128-1:0]             rt0_rdata;
+    wire [9*2-1:0]               rt0_rresp;
     wire [8:0]                   rt0_rlast;
 
     wire [8:0]                   rt1_awvalid;
     wire [8:0]                   rt1_awready;
-    wire [8*MSR_ID_WIDTH-1:0]    rt1_awid;
-    wire [8*ADDR_WIDTH-1:0]      rt1_awaddr;
-    wire [8*4-1:0]               rt1_awlen;
-    wire [8*3-1:0]               rt1_awsize;
-    wire [8*2-1:0]               rt1_awburst;
-    wire [8*2-1:0]               rt1_awlock;
-    wire [8*4-1:0]               rt1_awcache;
-    wire [8*3-1:0]               rt1_awprot;
+    wire [9*MSRP_ID_WIDTH-1:0]   rt1_awid;
+    wire [9*ADDR_WIDTH_M-1:0]      rt1_awaddr;
+    wire [9*4-1:0]               rt1_awlen;
+    wire [9*3-1:0]               rt1_awsize;
+    wire [9*2-1:0]               rt1_awburst;
+    wire [9*2-1:0]               rt1_awlock;
+    wire [9*4-1:0]               rt1_awcache;
+    wire [9*3-1:0]               rt1_awprot;
     wire [8:0]                   rt1_wvalid;
     wire [8:0]                   rt1_wready;
-    wire [8*MSR_ID_WIDTH-1:0]    rt1_wid;
-    wire [8*DATA_WIDTH_128-1:0]  rt1_wdata;
-    wire [8*STRB_W128-1:0]       rt1_wstrb;
+    wire [9*MSRP_ID_WIDTH-1:0]   rt1_wid;
+    wire [9*128-1:0]             rt1_wdata;
+    wire [9*16-1:0]              rt1_wstrb;
     wire [8:0]                   rt1_wlast;
     wire [8:0]                   rt1_bvalid;
     wire [8:0]                   rt1_bready;
-    wire [8*MSR_ID_WIDTH-1:0]    rt1_bid;
-    wire [8*2-1:0]               rt1_bresp;
+    wire [9*MSRP_ID_WIDTH-1:0]   rt1_bid;
+    wire [9*2-1:0]               rt1_bresp;
     wire [8:0]                   rt1_arvalid;
     wire [8:0]                   rt1_arready;
-    wire [8*MSR_ID_WIDTH-1:0]    rt1_arid;
-    wire [8*ADDR_WIDTH-1:0]      rt1_araddr;
-    wire [8*4-1:0]               rt1_arlen;
-    wire [8*3-1:0]               rt1_arsize;
-    wire [8*2-1:0]               rt1_arburst;
-    wire [8*2-1:0]               rt1_arlock;
-    wire [8*4-1:0]               rt1_arcache;
-    wire [8*3-1:0]               rt1_arprot;
+    wire [9*MSRP_ID_WIDTH-1:0]   rt1_arid;
+    wire [9*ADDR_WIDTH_M-1:0]      rt1_araddr;
+    wire [9*4-1:0]               rt1_arlen;
+    wire [9*3-1:0]               rt1_arsize;
+    wire [9*2-1:0]               rt1_arburst;
+    wire [9*2-1:0]               rt1_arlock;
+    wire [9*4-1:0]               rt1_arcache;
+    wire [9*3-1:0]               rt1_arprot;
     wire [8:0]                   rt1_rvalid;
     wire [8:0]                   rt1_rready;
-    wire [8*MSR_ID_WIDTH-1:0]    rt1_rid;
-    wire [8*DATA_WIDTH_128-1:0]  rt1_rdata;
-    wire [8*2-1:0]               rt1_rresp;
+    wire [9*MSRP_ID_WIDTH-1:0]   rt1_rid;
+    wire [9*128-1:0]             rt1_rdata;
+    wire [9*2-1:0]               rt1_rresp;
     wire [8:0]                   rt1_rlast;
+
+    wire [8:0]                   msrp_g_wvalid;
+    wire [8:0]                   msrp_g_wready;
+    wire [9*2-1:0]               msrp_aw_sel;
+    wire [9*2-1:0]               msrp_ar_sel;
+    wire [8:0]                   msrp_awready_rt;
 
     genvar gi;
     generate
-        for (gi = 0; gi < 9; gi = gi + 1) begin : g_msrp_router
+        for (gi = 0; gi < NUM_SRP; gi = gi + 1) begin : g_msrp_target_sel
+            axi3_msrp_io_region_sel #(
+                .ADDR_WIDTH(ADDR_WIDTH_M)
+            ) u_msrp_aw_target_sel (
+                .addr(msrp_awaddr[(gi*ADDR_WIDTH_M) +: ADDR_WIDTH_M]),
+                .sel(msrp_aw_sel[(gi*2) +: 2])
+            );
+
+            axi3_msrp_io_region_sel #(
+                .ADDR_WIDTH(ADDR_WIDTH_M)
+            ) u_msrp_ar_target_sel (
+                .addr(msrp_araddr[(gi*ADDR_WIDTH_M) +: ADDR_WIDTH_M]),
+                .sel(msrp_ar_sel[(gi*2) +: 2])
+            );
+        end
+    endgenerate
+
+    generate
+        for (gi = 0; gi < NUM_SRP; gi = gi + 1) begin : g_msrp_aw_w_gate
+            axi3_aw_w_order_gate #(
+                .PENDING_DEPTH(MSRP_WR_PENDING_DEPTH)
+            ) u_aw_w_gate (
+                .aclk(aclk), .aresetn(aresetn),
+                .awvalid(msrp_awvalid[gi]),
+                .awready_i(msrp_awready_rt[gi]),
+                .awready_o(msrp_awready[gi]),
+                .wvalid(msrp_wvalid[gi]), .wready(msrp_wready[gi]),
+                .wlast(msrp_wlast[gi]),
+                .wvalid_o(msrp_g_wvalid[gi]), .wready_i(msrp_g_wready[gi])
+            );
+        end
+    endgenerate
+
+    generate
+        for (gi = 0; gi < NUM_SRP; gi = gi + 1) begin : g_msrp_router
             wire [1:0]                   m_awvalid;
             wire [1:0]                   m_awready;
-            wire [2*MSR_ID_WIDTH-1:0]    m_awid;
-            wire [2*ADDR_WIDTH-1:0]      m_awaddr;
+            wire [2*MSRP_ID_WIDTH-1:0]    m_awid;
+            wire [2*ADDR_WIDTH_M-1:0]      m_awaddr;
             wire [2*4-1:0]               m_awlen;
             wire [2*3-1:0]               m_awsize;
             wire [2*2-1:0]               m_awburst;
@@ -372,18 +370,18 @@ module lbus_srps #(
             wire [2*3-1:0]               m_awprot;
             wire [1:0]                   m_wvalid;
             wire [1:0]                   m_wready;
-            wire [2*MSR_ID_WIDTH-1:0]    m_wid;
-            wire [2*DATA_WIDTH_128-1:0]  m_wdata;
-            wire [2*STRB_W128-1:0]       m_wstrb;
+            wire [2*MSRP_ID_WIDTH-1:0]    m_wid;
+            wire [2*128-1:0]               m_wdata;
+            wire [2*16-1:0]                m_wstrb;
             wire [1:0]                   m_wlast;
             wire [1:0]                   m_bvalid;
             wire [1:0]                   m_bready;
-            wire [2*MSR_ID_WIDTH-1:0]    m_bid;
+            wire [2*MSRP_ID_WIDTH-1:0]    m_bid;
             wire [2*2-1:0]               m_bresp;
             wire [1:0]                   m_arvalid;
             wire [1:0]                   m_arready;
-            wire [2*MSR_ID_WIDTH-1:0]    m_arid;
-            wire [2*ADDR_WIDTH-1:0]      m_araddr;
+            wire [2*MSRP_ID_WIDTH-1:0]    m_arid;
+            wire [2*ADDR_WIDTH_M-1:0]      m_araddr;
             wire [2*4-1:0]               m_arlen;
             wire [2*3-1:0]               m_arsize;
             wire [2*2-1:0]               m_arburst;
@@ -392,44 +390,44 @@ module lbus_srps #(
             wire [2*3-1:0]               m_arprot;
             wire [1:0]                   m_rvalid;
             wire [1:0]                   m_rready;
-            wire [2*MSR_ID_WIDTH-1:0]    m_rid;
-            wire [2*DATA_WIDTH_128-1:0]  m_rdata;
+            wire [2*MSRP_ID_WIDTH-1:0]    m_rid;
+            wire [2*128-1:0]               m_rdata;
             wire [2*2-1:0]               m_rresp;
             wire [1:0]                   m_rlast;
 
             axi3_router_1to2_128 #(
-                .ADDR_WIDTH(ADDR_WIDTH),
-                .DATA_WIDTH(DATA_WIDTH_128),
-                .STRB_WIDTH(STRB_W128),
-                .ID_WIDTH(MSR_ID_WIDTH)
+                .ADDR_WIDTH(ADDR_WIDTH_M),
+                .DATA_WIDTH(128),
+                .STRB_WIDTH(16),
+                .ID_WIDTH(MSRP_ID_WIDTH)
             ) u_router (
                 .aclk(aclk), .aresetn(aresetn),
                 .aw_sel(msrp_aw_sel[(gi*2) +: 2]),
                 .ar_sel(msrp_ar_sel[(gi*2) +: 2]),
                 .s_awvalid(msrp_awvalid[gi]),
-                .s_awready(msrp_awready[gi]),
-                .s_awid(msrp_awid[(gi*MSR_ID_WIDTH) +: MSR_ID_WIDTH]),
-                .s_awaddr(msrp_awaddr[(gi*ADDR_WIDTH) +: ADDR_WIDTH]),
+                .s_awready(msrp_awready_rt[gi]),
+                .s_awid(msrp_awid[(gi*MSRP_ID_WIDTH) +: MSRP_ID_WIDTH]),
+                .s_awaddr(msrp_awaddr[(gi*ADDR_WIDTH_M) +: ADDR_WIDTH_M]),
                 .s_awlen(msrp_awlen[(gi*4) +: 4]),
                 .s_awsize(msrp_awsize[(gi*3) +: 3]),
                 .s_awburst(msrp_awburst[(gi*2) +: 2]),
                 .s_awlock(msrp_awlock[(gi*2) +: 2]),
                 .s_awcache(msrp_awcache[(gi*4) +: 4]),
                 .s_awprot(msrp_awprot[(gi*3) +: 3]),
-                .s_wvalid(msrp_wvalid[gi]),
-                .s_wready(msrp_wready[gi]),
-                .s_wid(msrp_wid[(gi*MSR_ID_WIDTH) +: MSR_ID_WIDTH]),
-                .s_wdata(msrp_wdata[(gi*DATA_WIDTH_128) +: DATA_WIDTH_128]),
-                .s_wstrb(msrp_wstrb[(gi*STRB_W128) +: STRB_W128]),
+                .s_wvalid(msrp_g_wvalid[gi]),
+                .s_wready(msrp_g_wready[gi]),
+                .s_wid(msrp_wid[(gi*MSRP_ID_WIDTH) +: MSRP_ID_WIDTH]),
+                .s_wdata(msrp_wdata[(gi*128) +: 128]),
+                .s_wstrb(msrp_wstrb[(gi*16) +: 16]),
                 .s_wlast(msrp_wlast[gi]),
                 .s_bvalid(msrp_bvalid[gi]),
                 .s_bready(msrp_bready[gi]),
-                .s_bid(msrp_bid[(gi*MSR_ID_WIDTH) +: MSR_ID_WIDTH]),
+                .s_bid(msrp_bid[(gi*MSRP_ID_WIDTH) +: MSRP_ID_WIDTH]),
                 .s_bresp(msrp_bresp[(gi*2) +: 2]),
                 .s_arvalid(msrp_arvalid[gi]),
                 .s_arready(msrp_arready[gi]),
-                .s_arid(msrp_arid[(gi*MSR_ID_WIDTH) +: MSR_ID_WIDTH]),
-                .s_araddr(msrp_araddr[(gi*ADDR_WIDTH) +: ADDR_WIDTH]),
+                .s_arid(msrp_arid[(gi*MSRP_ID_WIDTH) +: MSRP_ID_WIDTH]),
+                .s_araddr(msrp_araddr[(gi*ADDR_WIDTH_M) +: ADDR_WIDTH_M]),
                 .s_arlen(msrp_arlen[(gi*4) +: 4]),
                 .s_arsize(msrp_arsize[(gi*3) +: 3]),
                 .s_arburst(msrp_arburst[(gi*2) +: 2]),
@@ -438,8 +436,8 @@ module lbus_srps #(
                 .s_arprot(msrp_arprot[(gi*3) +: 3]),
                 .s_rvalid(msrp_rvalid[gi]),
                 .s_rready(msrp_rready[gi]),
-                .s_rid(msrp_rid[(gi*MSR_ID_WIDTH) +: MSR_ID_WIDTH]),
-                .s_rdata(msrp_rdata[(gi*DATA_WIDTH_128) +: DATA_WIDTH_128]),
+                .s_rid(msrp_rid[(gi*MSRP_ID_WIDTH) +: MSRP_ID_WIDTH]),
+                .s_rdata(msrp_rdata[(gi*128) +: 128]),
                 .s_rresp(msrp_rresp[(gi*2) +: 2]),
                 .s_rlast(msrp_rlast[gi]),
                 .m_awvalid(m_awvalid), .m_awready(m_awready),
@@ -459,11 +457,11 @@ module lbus_srps #(
             );
 
             assign rt0_awvalid[gi]  = m_awvalid[0];
-            assign rt0_awready[gi]  = m_awready[0];
-            assign rt0_awid[(gi*MSR_ID_WIDTH) +: MSR_ID_WIDTH] =
-                m_awid[(0*MSR_ID_WIDTH) +: MSR_ID_WIDTH];
-            assign rt0_awaddr[(gi*ADDR_WIDTH) +: ADDR_WIDTH] =
-                m_awaddr[(0*ADDR_WIDTH) +: ADDR_WIDTH];
+            assign m_awready[0]     = rt0_awready[gi];
+            assign rt0_awid[(gi*MSRP_ID_WIDTH) +: MSRP_ID_WIDTH] =
+                m_awid[(0*MSRP_ID_WIDTH) +: MSRP_ID_WIDTH];
+            assign rt0_awaddr[(gi*ADDR_WIDTH_M) +: ADDR_WIDTH_M] =
+                m_awaddr[(0*ADDR_WIDTH_M) +: ADDR_WIDTH_M];
             assign rt0_awlen[(gi*4) +: 4]   = m_awlen[(0*4) +: 4];
             assign rt0_awsize[(gi*3) +: 3]  = m_awsize[(0*3) +: 3];
             assign rt0_awburst[(gi*2) +: 2] = m_awburst[(0*2) +: 2];
@@ -471,46 +469,43 @@ module lbus_srps #(
             assign rt0_awcache[(gi*4) +: 4] = m_awcache[(0*4) +: 4];
             assign rt0_awprot[(gi*3) +: 3]  = m_awprot[(0*3) +: 3];
             assign rt0_wvalid[gi]  = m_wvalid[0];
-            assign rt0_wready[gi]  = m_wready[0];
-            assign rt0_wid[(gi*MSR_ID_WIDTH) +: MSR_ID_WIDTH] =
-                m_wid[(0*MSR_ID_WIDTH) +: MSR_ID_WIDTH];
-            assign rt0_wdata[(gi*DATA_WIDTH_128) +: DATA_WIDTH_128] =
-                m_wdata[(0*DATA_WIDTH_128) +: DATA_WIDTH_128];
-            assign rt0_wstrb[(gi*STRB_W128) +: STRB_W128] =
-                m_wstrb[(0*STRB_W128) +: STRB_W128];
+            assign m_wready[0]      = rt0_wready[gi];
+            assign rt0_wid[(gi*MSRP_ID_WIDTH) +: MSRP_ID_WIDTH] =
+                m_wid[(0*MSRP_ID_WIDTH) +: MSRP_ID_WIDTH];
+            assign rt0_wdata[(gi*128) +: 128] = m_wdata[(0*128) +: 128];
+            assign rt0_wstrb[(gi*16) +: 16] = m_wstrb[(0*16) +: 16];
             assign rt0_wlast[gi] = m_wlast[0];
-            assign m_bready[0] = rt0_bready[gi];
-            assign rt0_bvalid[gi] = m_bvalid[0];
-            assign rt0_bid[(gi*MSR_ID_WIDTH) +: MSR_ID_WIDTH] =
-                m_bid[(0*MSR_ID_WIDTH) +: MSR_ID_WIDTH];
-            assign rt0_bresp[(gi*2) +: 2] = m_bresp[(0*2) +: 2];
+            assign m_bvalid[0]    = rt0_bvalid[gi];
+            assign rt0_bready[gi] = m_bready[0];
+            assign m_bid[(0*MSRP_ID_WIDTH) +: MSRP_ID_WIDTH] =
+                rt0_bid[(gi*MSRP_ID_WIDTH) +: MSRP_ID_WIDTH];
+            assign m_bresp[(0*2) +: 2] = rt0_bresp[(gi*2) +: 2];
             assign rt0_arvalid[gi] = m_arvalid[0];
-            assign rt0_arready[gi] = m_arready[0];
-            assign rt0_arid[(gi*MSR_ID_WIDTH) +: MSR_ID_WIDTH] =
-                m_arid[(0*MSR_ID_WIDTH) +: MSR_ID_WIDTH];
-            assign rt0_araddr[(gi*ADDR_WIDTH) +: ADDR_WIDTH] =
-                m_araddr[(0*ADDR_WIDTH) +: ADDR_WIDTH];
+            assign m_arready[0]     = rt0_arready[gi];
+            assign rt0_arid[(gi*MSRP_ID_WIDTH) +: MSRP_ID_WIDTH] =
+                m_arid[(0*MSRP_ID_WIDTH) +: MSRP_ID_WIDTH];
+            assign rt0_araddr[(gi*ADDR_WIDTH_M) +: ADDR_WIDTH_M] =
+                m_araddr[(0*ADDR_WIDTH_M) +: ADDR_WIDTH_M];
             assign rt0_arlen[(gi*4) +: 4]   = m_arlen[(0*4) +: 4];
             assign rt0_arsize[(gi*3) +: 3]  = m_arsize[(0*3) +: 3];
             assign rt0_arburst[(gi*2) +: 2] = m_arburst[(0*2) +: 2];
             assign rt0_arlock[(gi*2) +: 2]  = m_arlock[(0*2) +: 2];
             assign rt0_arcache[(gi*4) +: 4] = m_arcache[(0*4) +: 4];
             assign rt0_arprot[(gi*3) +: 3]  = m_arprot[(0*3) +: 3];
-            assign rt0_rvalid[gi] = m_rvalid[0];
-            assign rt0_rready[gi] = m_rready[0];
-            assign rt0_rid[(gi*MSR_ID_WIDTH) +: MSR_ID_WIDTH] =
-                m_rid[(0*MSR_ID_WIDTH) +: MSR_ID_WIDTH];
-            assign rt0_rdata[(gi*DATA_WIDTH_128) +: DATA_WIDTH_128] =
-                m_rdata[(0*DATA_WIDTH_128) +: DATA_WIDTH_128];
-            assign rt0_rresp[(gi*2) +: 2] = m_rresp[(0*2) +: 2];
-            assign rt0_rlast[gi] = m_rlast[0];
+            assign m_rvalid[0]     = rt0_rvalid[gi];
+            assign rt0_rready[gi]  = m_rready[0];
+            assign m_rid[(0*MSRP_ID_WIDTH) +: MSRP_ID_WIDTH] =
+                rt0_rid[(gi*MSRP_ID_WIDTH) +: MSRP_ID_WIDTH];
+            assign m_rdata[(0*128) +: 128] = rt0_rdata[(gi*128) +: 128];
+            assign m_rresp[(0*2) +: 2] = rt0_rresp[(gi*2) +: 2];
+            assign m_rlast[0] = rt0_rlast[gi];
 
             assign rt1_awvalid[gi]  = m_awvalid[1];
-            assign rt1_awready[gi]  = m_awready[1];
-            assign rt1_awid[(gi*MSR_ID_WIDTH) +: MSR_ID_WIDTH] =
-                m_awid[(1*MSR_ID_WIDTH) +: MSR_ID_WIDTH];
-            assign rt1_awaddr[(gi*ADDR_WIDTH) +: ADDR_WIDTH] =
-                m_awaddr[(1*ADDR_WIDTH) +: ADDR_WIDTH];
+            assign m_awready[1]     = rt1_awready[gi];
+            assign rt1_awid[(gi*MSRP_ID_WIDTH) +: MSRP_ID_WIDTH] =
+                m_awid[(1*MSRP_ID_WIDTH) +: MSRP_ID_WIDTH];
+            assign rt1_awaddr[(gi*ADDR_WIDTH_M) +: ADDR_WIDTH_M] =
+                m_awaddr[(1*ADDR_WIDTH_M) +: ADDR_WIDTH_M];
             assign rt1_awlen[(gi*4) +: 4]   = m_awlen[(1*4) +: 4];
             assign rt1_awsize[(gi*3) +: 3]  = m_awsize[(1*3) +: 3];
             assign rt1_awburst[(gi*2) +: 2] = m_awburst[(1*2) +: 2];
@@ -518,423 +513,378 @@ module lbus_srps #(
             assign rt1_awcache[(gi*4) +: 4] = m_awcache[(1*4) +: 4];
             assign rt1_awprot[(gi*3) +: 3]  = m_awprot[(1*3) +: 3];
             assign rt1_wvalid[gi]  = m_wvalid[1];
-            assign rt1_wready[gi]  = m_wready[1];
-            assign rt1_wid[(gi*MSR_ID_WIDTH) +: MSR_ID_WIDTH] =
-                m_wid[(1*MSR_ID_WIDTH) +: MSR_ID_WIDTH];
-            assign rt1_wdata[(gi*DATA_WIDTH_128) +: DATA_WIDTH_128] =
-                m_wdata[(1*DATA_WIDTH_128) +: DATA_WIDTH_128];
-            assign rt1_wstrb[(gi*STRB_W128) +: STRB_W128] =
-                m_wstrb[(1*STRB_W128) +: STRB_W128];
+            assign m_wready[1]      = rt1_wready[gi];
+            assign rt1_wid[(gi*MSRP_ID_WIDTH) +: MSRP_ID_WIDTH] =
+                m_wid[(1*MSRP_ID_WIDTH) +: MSRP_ID_WIDTH];
+            assign rt1_wdata[(gi*128) +: 128] = m_wdata[(1*128) +: 128];
+            assign rt1_wstrb[(gi*16) +: 16] = m_wstrb[(1*16) +: 16];
             assign rt1_wlast[gi] = m_wlast[1];
-            assign m_bready[1] = rt1_bready[gi];
-            assign rt1_bvalid[gi] = m_bvalid[1];
-            assign rt1_bid[(gi*MSR_ID_WIDTH) +: MSR_ID_WIDTH] =
-                m_bid[(1*MSR_ID_WIDTH) +: MSR_ID_WIDTH];
-            assign rt1_bresp[(gi*2) +: 2] = m_bresp[(1*2) +: 2];
+            assign m_bvalid[1]    = rt1_bvalid[gi];
+            assign rt1_bready[gi] = m_bready[1];
+            assign m_bid[(1*MSRP_ID_WIDTH) +: MSRP_ID_WIDTH] =
+                rt1_bid[(gi*MSRP_ID_WIDTH) +: MSRP_ID_WIDTH];
+            assign m_bresp[(1*2) +: 2] = rt1_bresp[(gi*2) +: 2];
             assign rt1_arvalid[gi] = m_arvalid[1];
-            assign rt1_arready[gi] = m_arready[1];
-            assign rt1_arid[(gi*MSR_ID_WIDTH) +: MSR_ID_WIDTH] =
-                m_arid[(1*MSR_ID_WIDTH) +: MSR_ID_WIDTH];
-            assign rt1_araddr[(gi*ADDR_WIDTH) +: ADDR_WIDTH] =
-                m_araddr[(1*ADDR_WIDTH) +: ADDR_WIDTH];
+            assign m_arready[1]     = rt1_arready[gi];
+            assign rt1_arid[(gi*MSRP_ID_WIDTH) +: MSRP_ID_WIDTH] =
+                m_arid[(1*MSRP_ID_WIDTH) +: MSRP_ID_WIDTH];
+            assign rt1_araddr[(gi*ADDR_WIDTH_M) +: ADDR_WIDTH_M] =
+                m_araddr[(1*ADDR_WIDTH_M) +: ADDR_WIDTH_M];
             assign rt1_arlen[(gi*4) +: 4]   = m_arlen[(1*4) +: 4];
             assign rt1_arsize[(gi*3) +: 3]  = m_arsize[(1*3) +: 3];
             assign rt1_arburst[(gi*2) +: 2] = m_arburst[(1*2) +: 2];
             assign rt1_arlock[(gi*2) +: 2]  = m_arlock[(1*2) +: 2];
             assign rt1_arcache[(gi*4) +: 4] = m_arcache[(1*4) +: 4];
             assign rt1_arprot[(gi*3) +: 3]  = m_arprot[(1*3) +: 3];
-            assign rt1_rvalid[gi] = m_rvalid[1];
-            assign rt1_rready[gi] = m_rready[1];
-            assign rt1_rid[(gi*MSR_ID_WIDTH) +: MSR_ID_WIDTH] =
-                m_rid[(1*MSR_ID_WIDTH) +: MSR_ID_WIDTH];
-            assign rt1_rdata[(gi*DATA_WIDTH_128) +: DATA_WIDTH_128] =
-                m_rdata[(1*DATA_WIDTH_128) +: DATA_WIDTH_128];
-            assign rt1_rresp[(gi*2) +: 2] = m_rresp[(1*2) +: 2];
-            assign rt1_rlast[gi] = m_rlast[1];
+            assign m_rvalid[1]     = rt1_rvalid[gi];
+            assign rt1_rready[gi]  = m_rready[1];
+            assign m_rid[(1*MSRP_ID_WIDTH) +: MSRP_ID_WIDTH] =
+                rt1_rid[(gi*MSRP_ID_WIDTH) +: MSRP_ID_WIDTH];
+            assign m_rdata[(1*128) +: 128] = rt1_rdata[(gi*128) +: 128];
+            assign m_rresp[(1*2) +: 2] = rt1_rresp[(gi*2) +: 2];
+            assign m_rlast[1] = rt1_rlast[gi];
         end
     endgenerate
 
-    // Target0: msrp0~3 -> sextmem0, msrp4~7 -> sextmem1, msrp8 bypass -> sextmem2
-    wire [3:0] mem0_s_awvalid;
-    wire [3:0] mem0_s_awready;
-    wire [3*MSR_ID_WIDTH-1:0] mem0_s_awid;
-    wire [3*ADDR_WIDTH-1:0]     mem0_s_awaddr;
-    wire [3*4-1:0]              mem0_s_awlen;
-    wire [3*3-1:0]              mem0_s_awsize;
-    wire [3*2-1:0]              mem0_s_awburst;
-    wire [3*2-1:0]              mem0_s_awlock;
-    wire [3*4-1:0]              mem0_s_awcache;
-    wire [3*3-1:0]              mem0_s_awprot;
-    wire [3:0] mem0_s_wvalid;
-    wire [3:0] mem0_s_wready;
-    wire [3*MSR_ID_WIDTH-1:0] mem0_s_wid;
-    wire [3*DATA_WIDTH_128-1:0] mem0_s_wdata;
-    wire [3*STRB_W128-1:0] mem0_s_wstrb;
-    wire [3:0] mem0_s_wlast;
-    wire [3:0] mem0_s_bvalid;
-    wire [3:0] mem0_s_bready;
-    wire [3*MSR_ID_WIDTH-1:0] mem0_s_bid;
-    wire [3*2-1:0] mem0_s_bresp;
-    wire [3:0] mem0_s_arvalid;
-    wire [3:0] mem0_s_arready;
-    wire [3*MSR_ID_WIDTH-1:0] mem0_s_arid;
-    wire [3*ADDR_WIDTH-1:0] mem0_s_araddr;
-    wire [3*4-1:0] mem0_s_arlen;
-    wire [3*3-1:0] mem0_s_arsize;
-    wire [3*2-1:0] mem0_s_arburst;
-    wire [3*2-1:0] mem0_s_arlock;
-    wire [3*4-1:0] mem0_s_arcache;
-    wire [3*3-1:0] mem0_s_arprot;
-    wire [3:0] mem0_s_rvalid;
-    wire [3:0] mem0_s_rready;
-    wire [3*MSR_ID_WIDTH-1:0] mem0_s_rid;
-    wire [3*DATA_WIDTH_128-1:0] mem0_s_rdata;
-    wire [3*2-1:0] mem0_s_rresp;
-    wire [3:0] mem0_s_rlast;
+    // Target0 (mem): msrp[0..7] -> mem N:1 -> sextmem[0..NUM_MEM_MERGE-1]; msrp[8] bypass
+    genvar mi;
+    generate
+        for (mi = 0; mi < NUM_MEM_MERGE; mi = mi + 1) begin : g_mem_merge
+            localparam integer RT_LO = mi * MEM_MERGE_N;
 
-    assign mem0_s_awvalid = rt0_awvalid[3:0];
-    assign rt0_awready[3:0] = mem0_s_awready;
-    assign mem0_s_awid    = rt0_awid[3*MSR_ID_WIDTH-1:0];
-    assign mem0_s_awaddr  = rt0_awaddr[3*ADDR_WIDTH-1:0];
-    assign mem0_s_awlen   = rt0_awlen[3*4-1:0];
-    assign mem0_s_awsize  = rt0_awsize[3*3-1:0];
-    assign mem0_s_awburst = rt0_awburst[3*2-1:0];
-    assign mem0_s_awlock  = rt0_awlock[3*2-1:0];
-    assign mem0_s_awcache = rt0_awcache[3*4-1:0];
-    assign mem0_s_awprot  = rt0_awprot[3*3-1:0];
-    assign mem0_s_wvalid  = rt0_wvalid[3:0];
-    assign rt0_wready[3:0] = mem0_s_wready;
-    assign mem0_s_wid     = rt0_wid[3*MSR_ID_WIDTH-1:0];
-    assign mem0_s_wdata   = rt0_wdata[3*DATA_WIDTH_128-1:0];
-    assign mem0_s_wstrb   = rt0_wstrb[3*STRB_W128-1:0];
-    assign mem0_s_wlast   = rt0_wlast[3:0];
-    assign rt0_bvalid[3:0] = mem0_s_bvalid;
-    assign mem0_s_bready  = rt0_bready[3:0];
-    assign rt0_bid[3*MSR_ID_WIDTH-1:0]   = mem0_s_bid;
-    assign rt0_bresp[3*2-1:0]            = mem0_s_bresp;
-    assign mem0_s_arvalid = rt0_arvalid[3:0];
-    assign rt0_arready[3:0] = mem0_s_arready;
-    assign mem0_s_arid    = rt0_arid[3*MSR_ID_WIDTH-1:0];
-    assign mem0_s_araddr  = rt0_araddr[3*ADDR_WIDTH-1:0];
-    assign mem0_s_arlen   = rt0_arlen[3*4-1:0];
-    assign mem0_s_arsize  = rt0_arsize[3*3-1:0];
-    assign mem0_s_arburst = rt0_arburst[3*2-1:0];
-    assign mem0_s_arlock  = rt0_arlock[3*2-1:0];
-    assign mem0_s_arcache = rt0_arcache[3*4-1:0];
-    assign mem0_s_arprot  = rt0_arprot[3*3-1:0];
-    assign rt0_rvalid[3:0] = mem0_s_rvalid;
-    assign mem0_s_rready  = rt0_rready[3:0];
-    assign rt0_rid[3*MSR_ID_WIDTH-1:0]   = mem0_s_rid;
-    assign rt0_rdata[3*DATA_WIDTH_128-1:0] = mem0_s_rdata;
-    assign rt0_rresp[3*2-1:0]            = mem0_s_rresp;
-    assign rt0_rlast[3:0] = mem0_s_rlast;
+            wire [MEM_MERGE_N-1:0]                   mem_s_awvalid;
+            wire [MEM_MERGE_N-1:0]                   mem_s_awready;
+            wire [MEM_MERGE_N*MSRP_ID_WIDTH-1:0]     mem_s_awid;
+            wire [MEM_MERGE_N*ADDR_WIDTH_M-1:0]        mem_s_awaddr;
+            wire [MEM_MERGE_N*4-1:0]                 mem_s_awlen;
+            wire [MEM_MERGE_N*3-1:0]                 mem_s_awsize;
+            wire [MEM_MERGE_N*2-1:0]                 mem_s_awburst;
+            wire [MEM_MERGE_N*2-1:0]                 mem_s_awlock;
+            wire [MEM_MERGE_N*4-1:0]                 mem_s_awcache;
+            wire [MEM_MERGE_N*3-1:0]                 mem_s_awprot;
+            wire [MEM_MERGE_N-1:0]                   mem_s_wvalid;
+            wire [MEM_MERGE_N-1:0]                   mem_s_wready;
+            wire [MEM_MERGE_N*MSRP_ID_WIDTH-1:0]     mem_s_wid;
+            wire [MEM_MERGE_N*128-1:0]               mem_s_wdata;
+            wire [MEM_MERGE_N*16-1:0]                mem_s_wstrb;
+            wire [MEM_MERGE_N-1:0]                   mem_s_wlast;
+            wire [MEM_MERGE_N-1:0]                   mem_s_bvalid;
+            wire [MEM_MERGE_N-1:0]                   mem_s_bready;
+            wire [MEM_MERGE_N*MSRP_ID_WIDTH-1:0]     mem_s_bid;
+            wire [MEM_MERGE_N*2-1:0]                 mem_s_bresp;
+            wire [MEM_MERGE_N-1:0]                   mem_s_arvalid;
+            wire [MEM_MERGE_N-1:0]                   mem_s_arready;
+            wire [MEM_MERGE_N*MSRP_ID_WIDTH-1:0]     mem_s_arid;
+            wire [MEM_MERGE_N*ADDR_WIDTH_M-1:0]        mem_s_araddr;
+            wire [MEM_MERGE_N*4-1:0]                 mem_s_arlen;
+            wire [MEM_MERGE_N*3-1:0]                 mem_s_arsize;
+            wire [MEM_MERGE_N*2-1:0]                 mem_s_arburst;
+            wire [MEM_MERGE_N*2-1:0]                 mem_s_arlock;
+            wire [MEM_MERGE_N*4-1:0]                 mem_s_arcache;
+            wire [MEM_MERGE_N*3-1:0]                 mem_s_arprot;
+            wire [MEM_MERGE_N-1:0]                   mem_s_rvalid;
+            wire [MEM_MERGE_N-1:0]                   mem_s_rready;
+            wire [MEM_MERGE_N*MSRP_ID_WIDTH-1:0]     mem_s_rid;
+            wire [MEM_MERGE_N*128-1:0]               mem_s_rdata;
+            wire [MEM_MERGE_N*2-1:0]                 mem_s_rresp;
+            wire [MEM_MERGE_N-1:0]                   mem_s_rlast;
 
-    wire mem0_m_awvalid, mem0_m_wvalid, mem0_m_bvalid, mem0_m_arvalid, mem0_m_rvalid;
-    wire mem0_m_awready, mem0_m_wready, mem0_m_bready, mem0_m_arready, mem0_m_rready;
-    wire [MEM01_ID_W-1:0] mem0_m_awid, mem0_m_wid, mem0_m_bid, mem0_m_arid, mem0_m_rid;
-    wire [ADDR_WIDTH-1:0] mem0_m_awaddr, mem0_m_araddr;
-    wire [3:0] mem0_m_awlen, mem0_m_arlen;
-    wire [2:0] mem0_m_awsize, mem0_m_arsize;
-    wire [1:0] mem0_m_awburst, mem0_m_arburst, mem0_m_awlock, mem0_m_arlock;
-    wire [3:0] mem0_m_awcache, mem0_m_arcache;
-    wire [2:0] mem0_m_awprot, mem0_m_arprot;
-    wire [DATA_WIDTH_128-1:0] mem0_m_wdata, mem0_m_rdata;
-    wire [STRB_W128-1:0] mem0_m_wstrb;
-    wire mem0_m_wlast, mem0_m_rlast;
-    wire [1:0] mem0_m_bresp, mem0_m_rresp;
+            wire                                   mem_m_awvalid;
+            wire                                   mem_m_wvalid;
+            wire                                   mem_m_bvalid;
+            wire                                   mem_m_arvalid;
+            wire                                   mem_m_rvalid;
+            wire                                   mem_m_awready;
+            wire                                   mem_m_wready;
+            wire                                   mem_m_bready;
+            wire                                   mem_m_arready;
+            wire                                   mem_m_rready;
+            wire [MEM_MERGE_ID_W-1:0]              mem_m_awid;
+            wire [MEM_MERGE_ID_W-1:0]              mem_m_wid;
+            wire [MEM_MERGE_ID_W-1:0]              mem_m_bid;
+            wire [MEM_MERGE_ID_W-1:0]              mem_m_arid;
+            wire [MEM_MERGE_ID_W-1:0]              mem_m_rid;
+            wire [ADDR_WIDTH_M-1:0]                  mem_m_awaddr;
+            wire [ADDR_WIDTH_M-1:0]                  mem_m_araddr;
+            wire [3:0]                             mem_m_awlen;
+            wire [3:0]                             mem_m_arlen;
+            wire [2:0]                             mem_m_awsize;
+            wire [2:0]                             mem_m_arsize;
+            wire [1:0]                             mem_m_awburst;
+            wire [1:0]                             mem_m_arburst;
+            wire [1:0]                             mem_m_awlock;
+            wire [1:0]                             mem_m_arlock;
+            wire [3:0]                             mem_m_awcache;
+            wire [3:0]                             mem_m_arcache;
+            wire [2:0]                             mem_m_awprot;
+            wire [2:0]                             mem_m_arprot;
+            wire [127:0]                           mem_m_wdata;
+            wire [127:0]                           mem_m_rdata;
+            wire [15:0]                            mem_m_wstrb;
+            wire                                   mem_m_wlast;
+            wire                                   mem_m_rlast;
+            wire [1:0]                             mem_m_bresp;
+            wire [1:0]                             mem_m_rresp;
 
-    axi3_merge_Nto1_128 #(
-        .N(4), .IN_ID_WIDTH(MSR_ID_WIDTH), .SRC_ID_WIDTH(2)
-    ) u_merge_mem0 (
-        .aclk(aclk), .aresetn(aresetn),
-        .s_awvalid(mem0_s_awvalid), .s_awready(mem0_s_awready), .s_awid(mem0_s_awid),
-        .s_awaddr(mem0_s_awaddr), .s_awlen(mem0_s_awlen), .s_awsize(mem0_s_awsize),
-        .s_awburst(mem0_s_awburst), .s_awlock(mem0_s_awlock), .s_awcache(mem0_s_awcache),
-        .s_awprot(mem0_s_awprot),
-        .s_wvalid(mem0_s_wvalid), .s_wready(mem0_s_wready), .s_wid(mem0_s_wid),
-        .s_wdata(mem0_s_wdata), .s_wstrb(mem0_s_wstrb), .s_wlast(mem0_s_wlast),
-        .s_bvalid(mem0_s_bvalid), .s_bready(mem0_s_bready), .s_bid(mem0_s_bid),
-        .s_bresp(mem0_s_bresp),
-        .s_arvalid(mem0_s_arvalid), .s_arready(mem0_s_arready), .s_arid(mem0_s_arid),
-        .s_araddr(mem0_s_araddr), .s_arlen(mem0_s_arlen), .s_arsize(mem0_s_arsize),
-        .s_arburst(mem0_s_arburst), .s_arlock(mem0_s_arlock), .s_arcache(mem0_s_arcache),
-        .s_arprot(mem0_s_arprot),
-        .s_rvalid(mem0_s_rvalid), .s_rready(mem0_s_rready), .s_rid(mem0_s_rid),
-        .s_rdata(mem0_s_rdata), .s_rresp(mem0_s_rresp), .s_rlast(mem0_s_rlast),
-        .m_awvalid(mem0_m_awvalid), .m_awready(mem0_m_awready), .m_awid(mem0_m_awid),
-        .m_awaddr(mem0_m_awaddr), .m_awlen(mem0_m_awlen), .m_awsize(mem0_m_awsize),
-        .m_awburst(mem0_m_awburst), .m_awlock(mem0_m_awlock), .m_awcache(mem0_m_awcache),
-        .m_awprot(mem0_m_awprot),
-        .m_wvalid(mem0_m_wvalid), .m_wready(mem0_m_wready), .m_wid(mem0_m_wid),
-        .m_wdata(mem0_m_wdata), .m_wstrb(mem0_m_wstrb), .m_wlast(mem0_m_wlast),
-        .m_bvalid(mem0_m_bvalid), .m_bready(mem0_m_bready), .m_bid(mem0_m_bid),
-        .m_bresp(mem0_m_bresp),
-        .m_arvalid(mem0_m_arvalid), .m_arready(mem0_m_arready), .m_arid(mem0_m_arid),
-        .m_araddr(mem0_m_araddr), .m_arlen(mem0_m_arlen), .m_arsize(mem0_m_arsize),
-        .m_arburst(mem0_m_arburst), .m_arlock(mem0_m_arlock), .m_arcache(mem0_m_arcache),
-        .m_arprot(mem0_m_arprot),
-        .m_rvalid(mem0_m_rvalid), .m_rready(mem0_m_rready), .m_rid(mem0_m_rid),
-        .m_rdata(mem0_m_rdata), .m_rresp(mem0_m_rresp), .m_rlast(mem0_m_rlast)
-    );
+            wire [SEXTMEM_ID_WIDTH-1:0]            mem_m_awid_z;
+            wire [SEXTMEM_ID_WIDTH-1:0]            mem_m_wid_z;
+            wire [SEXTMEM_ID_WIDTH-1:0]            mem_m_bid_z;
+            wire [SEXTMEM_ID_WIDTH-1:0]            mem_m_arid_z;
+            wire [SEXTMEM_ID_WIDTH-1:0]            mem_m_rid_z;
 
-    lbus_axi128_reg_slice_wrap #(
-        .ID_WIDTH(MEM01_ID_W), .ADDR_WIDTH(ADDR_WIDTH), .DATA_WIDTH(DATA_WIDTH_128),
-        .AW_SLICE_EN(SEXT_SLICE_EN), .W_SLICE_EN(SEXT_SLICE_EN), .B_SLICE_EN(SEXT_SLICE_EN),
-        .AR_SLICE_EN(SEXT_SLICE_EN), .R_SLICE_EN(SEXT_SLICE_EN)
-    ) u_sextmem0_rs (
-        .aclk(aclk), .aresetn(aresetn),
-        .awvalid_s(mem0_m_awvalid), .awready_s(mem0_m_awready),
-        .awid_s(mem0_m_awid), .awaddr_s(mem0_m_awaddr), .awlen_s(mem0_m_awlen),
-        .awsize_s(mem0_m_awsize), .awburst_s(mem0_m_awburst), .awlock_s(mem0_m_awlock),
-        .awcache_s(mem0_m_awcache), .awprot_s(mem0_m_awprot),
-        .awvalid_m(sextmem0_awvalid), .awready_m(sextmem0_awready),
-        .awid_m(sextmem0_awid), .awaddr_m(sextmem0_awaddr), .awlen_m(sextmem0_awlen),
-        .awsize_m(sextmem0_awsize), .awburst_m(sextmem0_awburst), .awlock_m(sextmem0_awlock),
-        .awcache_m(sextmem0_awcache), .awprot_m(sextmem0_awprot),
-        .wvalid_s(mem0_m_wvalid), .wready_s(mem0_m_wready),
-        .wid_s(mem0_m_wid), .wdata_s(mem0_m_wdata), .wstrb_s(mem0_m_wstrb), .wlast_s(mem0_m_wlast),
-        .wvalid_m(sextmem0_wvalid), .wready_m(sextmem0_wready),
-        .wid_m(sextmem0_wid), .wdata_m(sextmem0_wdata), .wstrb_m(sextmem0_wstrb),
-        .wlast_m(sextmem0_wlast),
-        .bvalid_s(sextmem0_bvalid), .bready_s(sextmem0_bready),
-        .bid_s(sextmem0_bid), .bresp_s(sextmem0_bresp),
-        .bvalid_m(mem0_m_bvalid), .bready_m(mem0_m_bready),
-        .bid_m(mem0_m_bid), .bresp_m(mem0_m_bresp),
-        .arvalid_s(mem0_m_arvalid), .arready_s(mem0_m_arready),
-        .arid_s(mem0_m_arid), .araddr_s(mem0_m_araddr), .arlen_s(mem0_m_arlen),
-        .arsize_s(mem0_m_arsize), .arburst_s(mem0_m_arburst), .arlock_s(mem0_m_arlock),
-        .arcache_s(mem0_m_arcache), .arprot_s(mem0_m_arprot),
-        .arvalid_m(sextmem0_arvalid), .arready_m(sextmem0_arready),
-        .arid_m(sextmem0_arid), .araddr_m(sextmem0_araddr), .arlen_m(sextmem0_arlen),
-        .arsize_m(sextmem0_arsize), .arburst_m(sextmem0_arburst), .arlock_m(sextmem0_arlock),
-        .arcache_m(sextmem0_arcache), .arprot_m(sextmem0_arprot),
-        .rvalid_s(sextmem0_rvalid), .rready_s(sextmem0_rready),
-        .rid_s(sextmem0_rid), .rdata_s(sextmem0_rdata), .rresp_s(sextmem0_rresp),
-        .rlast_s(sextmem0_rlast),
-        .rvalid_m(mem0_m_rvalid), .rready_m(mem0_m_rready),
-        .rid_m(mem0_m_rid), .rdata_m(mem0_m_rdata), .rresp_m(mem0_m_rresp),
-        .rlast_m(mem0_m_rlast)
-    );
+            assign mem_s_awvalid = rt0_awvalid[RT_LO +: MEM_MERGE_N];
+            assign rt0_awready[RT_LO +: MEM_MERGE_N] = mem_s_awready;
+            assign mem_s_awid    = rt0_awid[(RT_LO*MSRP_ID_WIDTH) +: MEM_MERGE_N*MSRP_ID_WIDTH];
+            assign mem_s_awaddr  = rt0_awaddr[(RT_LO*ADDR_WIDTH_M) +: MEM_MERGE_N*ADDR_WIDTH_M];
+            assign mem_s_awlen   = rt0_awlen[(RT_LO*4) +: MEM_MERGE_N*4];
+            assign mem_s_awsize  = rt0_awsize[(RT_LO*3) +: MEM_MERGE_N*3];
+            assign mem_s_awburst = rt0_awburst[(RT_LO*2) +: MEM_MERGE_N*2];
+            assign mem_s_awlock  = rt0_awlock[(RT_LO*2) +: MEM_MERGE_N*2];
+            assign mem_s_awcache = rt0_awcache[(RT_LO*4) +: MEM_MERGE_N*4];
+            assign mem_s_awprot  = rt0_awprot[(RT_LO*3) +: MEM_MERGE_N*3];
+            assign mem_s_wvalid  = rt0_wvalid[RT_LO +: MEM_MERGE_N];
+            assign rt0_wready[RT_LO +: MEM_MERGE_N] = mem_s_wready;
+            assign mem_s_wid     = rt0_wid[(RT_LO*MSRP_ID_WIDTH) +: MEM_MERGE_N*MSRP_ID_WIDTH];
+            assign mem_s_wdata   = rt0_wdata[(RT_LO*128) +: MEM_MERGE_N*128];
+            assign mem_s_wstrb   = rt0_wstrb[(RT_LO*16) +: MEM_MERGE_N*16];
+            assign mem_s_wlast   = rt0_wlast[RT_LO +: MEM_MERGE_N];
+            assign rt0_bvalid[RT_LO +: MEM_MERGE_N] = mem_s_bvalid;
+            assign mem_s_bready  = rt0_bready[RT_LO +: MEM_MERGE_N];
+            assign rt0_bid[(RT_LO*MSRP_ID_WIDTH) +: MEM_MERGE_N*MSRP_ID_WIDTH] = mem_s_bid;
+            assign rt0_bresp[(RT_LO*2) +: MEM_MERGE_N*2] = mem_s_bresp;
+            assign mem_s_arvalid = rt0_arvalid[RT_LO +: MEM_MERGE_N];
+            assign rt0_arready[RT_LO +: MEM_MERGE_N] = mem_s_arready;
+            assign mem_s_arid    = rt0_arid[(RT_LO*MSRP_ID_WIDTH) +: MEM_MERGE_N*MSRP_ID_WIDTH];
+            assign mem_s_araddr  = rt0_araddr[(RT_LO*ADDR_WIDTH_M) +: MEM_MERGE_N*ADDR_WIDTH_M];
+            assign mem_s_arlen   = rt0_arlen[(RT_LO*4) +: MEM_MERGE_N*4];
+            assign mem_s_arsize  = rt0_arsize[(RT_LO*3) +: MEM_MERGE_N*3];
+            assign mem_s_arburst = rt0_arburst[(RT_LO*2) +: MEM_MERGE_N*2];
+            assign mem_s_arlock  = rt0_arlock[(RT_LO*2) +: MEM_MERGE_N*2];
+            assign mem_s_arcache = rt0_arcache[(RT_LO*4) +: MEM_MERGE_N*4];
+            assign mem_s_arprot  = rt0_arprot[(RT_LO*3) +: MEM_MERGE_N*3];
+            assign rt0_rvalid[RT_LO +: MEM_MERGE_N] = mem_s_rvalid;
+            assign mem_s_rready  = rt0_rready[RT_LO +: MEM_MERGE_N];
+            assign rt0_rid[(RT_LO*MSRP_ID_WIDTH) +: MEM_MERGE_N*MSRP_ID_WIDTH] = mem_s_rid;
+            assign rt0_rdata[(RT_LO*128) +: MEM_MERGE_N*128] = mem_s_rdata;
+            assign rt0_rresp[(RT_LO*2) +: MEM_MERGE_N*2] = mem_s_rresp;
+            assign rt0_rlast[RT_LO +: MEM_MERGE_N] = mem_s_rlast;
 
-    // mem1: msrp4~7 -> sextmem1 (same structure as mem0)
-    wire [3:0] mem1_s_awvalid;
-    wire [3:0] mem1_s_awready;
-    wire [3*MSR_ID_WIDTH-1:0] mem1_s_awid;
-    wire [3*ADDR_WIDTH-1:0]     mem1_s_awaddr;
-    wire [3*4-1:0]              mem1_s_awlen;
-    wire [3*3-1:0]              mem1_s_awsize;
-    wire [3*2-1:0]              mem1_s_awburst;
-    wire [3*2-1:0]              mem1_s_awlock;
-    wire [3*4-1:0]              mem1_s_awcache;
-    wire [3*3-1:0]              mem1_s_awprot;
-    wire [3:0] mem1_s_wvalid, mem1_s_wready, mem1_s_wlast;
-    wire [3*MSR_ID_WIDTH-1:0] mem1_s_wid;
-    wire [3*DATA_WIDTH_128-1:0] mem1_s_wdata;
-    wire [3*STRB_W128-1:0] mem1_s_wstrb;
-    wire [3:0] mem1_s_bvalid, mem1_s_bready;
-    wire [3*MSR_ID_WIDTH-1:0] mem1_s_bid;
-    wire [3*2-1:0] mem1_s_bresp;
-    wire [3:0] mem1_s_arvalid, mem1_s_arready, mem1_s_rvalid, mem1_s_rready, mem1_s_rlast;
-    wire [3*MSR_ID_WIDTH-1:0] mem1_s_arid, mem1_s_rid;
-    wire [3*ADDR_WIDTH-1:0] mem1_s_araddr;
-    wire [3*4-1:0] mem1_s_arlen;
-    wire [3*3-1:0] mem1_s_arsize;
-    wire [3*2-1:0] mem1_s_arburst, mem1_s_arlock;
-    wire [3*4-1:0] mem1_s_arcache;
-    wire [3*3-1:0] mem1_s_arprot;
-    wire [3*DATA_WIDTH_128-1:0] mem1_s_rdata;
-    wire [3*2-1:0] mem1_s_rresp;
+            axi3_merge_Nto1_128 #(
+                .N(MEM_MERGE_N),
+                .ADDR_WIDTH(ADDR_WIDTH_M),
+                .IN_ID_WIDTH(MSRP_ID_WIDTH),
+                .WR_OUTSTANDING_DEPTH(MSRP_WR_PENDING_DEPTH),
+                .SRC_ID_WIDTH(MEM_MERGE_TAG_W)
+            ) u_mem_merge (
+                .aclk(aclk), .aresetn(aresetn),
+                .s_awvalid(mem_s_awvalid), .s_awready(mem_s_awready), .s_awid(mem_s_awid),
+                .s_awaddr(mem_s_awaddr), .s_awlen(mem_s_awlen), .s_awsize(mem_s_awsize),
+                .s_awburst(mem_s_awburst), .s_awlock(mem_s_awlock), .s_awcache(mem_s_awcache),
+                .s_awprot(mem_s_awprot),
+                .s_wvalid(mem_s_wvalid), .s_wready(mem_s_wready), .s_wid(mem_s_wid),
+                .s_wdata(mem_s_wdata), .s_wstrb(mem_s_wstrb), .s_wlast(mem_s_wlast),
+                .s_bvalid(mem_s_bvalid), .s_bready(mem_s_bready), .s_bid(mem_s_bid),
+                .s_bresp(mem_s_bresp),
+                .s_arvalid(mem_s_arvalid), .s_arready(mem_s_arready), .s_arid(mem_s_arid),
+                .s_araddr(mem_s_araddr), .s_arlen(mem_s_arlen), .s_arsize(mem_s_arsize),
+                .s_arburst(mem_s_arburst), .s_arlock(mem_s_arlock), .s_arcache(mem_s_arcache),
+                .s_arprot(mem_s_arprot),
+                .s_rvalid(mem_s_rvalid), .s_rready(mem_s_rready), .s_rid(mem_s_rid),
+                .s_rdata(mem_s_rdata), .s_rresp(mem_s_rresp), .s_rlast(mem_s_rlast),
+                .m_awvalid(mem_m_awvalid), .m_awready(mem_m_awready), .m_awid(mem_m_awid),
+                .m_awaddr(mem_m_awaddr), .m_awlen(mem_m_awlen), .m_awsize(mem_m_awsize),
+                .m_awburst(mem_m_awburst), .m_awlock(mem_m_awlock), .m_awcache(mem_m_awcache),
+                .m_awprot(mem_m_awprot),
+                .m_wvalid(mem_m_wvalid), .m_wready(mem_m_wready), .m_wid(mem_m_wid),
+                .m_wdata(mem_m_wdata), .m_wstrb(mem_m_wstrb), .m_wlast(mem_m_wlast),
+                .m_bvalid(mem_m_bvalid), .m_bready(mem_m_bready), .m_bid(mem_m_bid),
+                .m_bresp(mem_m_bresp),
+                .m_arvalid(mem_m_arvalid), .m_arready(mem_m_arready), .m_arid(mem_m_arid),
+                .m_araddr(mem_m_araddr), .m_arlen(mem_m_arlen), .m_arsize(mem_m_arsize),
+                .m_arburst(mem_m_arburst), .m_arlock(mem_m_arlock), .m_arcache(mem_m_arcache),
+                .m_arprot(mem_m_arprot),
+                .m_rvalid(mem_m_rvalid), .m_rready(mem_m_rready), .m_rid(mem_m_rid),
+                .m_rdata(mem_m_rdata), .m_rresp(mem_m_rresp), .m_rlast(mem_m_rlast)
+            );
 
-    assign mem1_s_awvalid = rt0_awvalid[7:4];
-    assign rt0_awready[7:4] = mem1_s_awready;
-    assign mem1_s_awid    = rt0_awid[7*MSR_ID_WIDTH-1:4*MSR_ID_WIDTH];
-    assign mem1_s_awaddr  = rt0_awaddr[7*ADDR_WIDTH-1:4*ADDR_WIDTH];
-    assign mem1_s_awlen   = rt0_awlen[7*4-1:4*4];
-    assign mem1_s_awsize  = rt0_awsize[7*3-1:4*3];
-    assign mem1_s_awburst = rt0_awburst[7*2-1:4*2];
-    assign mem1_s_awlock  = rt0_awlock[7*2-1:4*2];
-    assign mem1_s_awcache = rt0_awcache[7*4-1:4*4];
-    assign mem1_s_awprot  = rt0_awprot[7*3-1:4*3];
-    assign mem1_s_wvalid  = rt0_wvalid[7:4];
-    assign rt0_wready[7:4] = mem1_s_wready;
-    assign mem1_s_wid     = rt0_wid[7*MSR_ID_WIDTH-1:4*MSR_ID_WIDTH];
-    assign mem1_s_wdata   = rt0_wdata[7*DATA_WIDTH_128-1:4*DATA_WIDTH_128];
-    assign mem1_s_wstrb   = rt0_wstrb[7*STRB_W128-1:4*STRB_W128];
-    assign mem1_s_wlast   = rt0_wlast[7:4];
-    assign rt0_bvalid[7:4] = mem1_s_bvalid;
-    assign mem1_s_bready  = rt0_bready[7:4];
-    assign rt0_bid[7*MSR_ID_WIDTH-1:4*MSR_ID_WIDTH]   = mem1_s_bid;
-    assign rt0_bresp[7*2-1:4*2]                       = mem1_s_bresp;
-    assign mem1_s_arvalid = rt0_arvalid[7:4];
-    assign rt0_arready[7:4] = mem1_s_arready;
-    assign mem1_s_arid    = rt0_arid[7*MSR_ID_WIDTH-1:4*MSR_ID_WIDTH];
-    assign mem1_s_araddr  = rt0_araddr[7*ADDR_WIDTH-1:4*ADDR_WIDTH];
-    assign mem1_s_arlen   = rt0_arlen[7*4-1:4*4];
-    assign mem1_s_arsize  = rt0_arsize[7*3-1:4*3];
-    assign mem1_s_arburst = rt0_arburst[7*2-1:4*2];
-    assign mem1_s_arlock  = rt0_arlock[7*2-1:4*2];
-    assign mem1_s_arcache = rt0_arcache[7*4-1:4*4];
-    assign mem1_s_arprot  = rt0_arprot[7*3-1:4*3];
-    assign rt0_rvalid[7:4] = mem1_s_rvalid;
-    assign mem1_s_rready  = rt0_rready[7:4];
-    assign rt0_rid[7*MSR_ID_WIDTH-1:4*MSR_ID_WIDTH]       = mem1_s_rid;
-    assign rt0_rdata[7*DATA_WIDTH_128-1:4*DATA_WIDTH_128] = mem1_s_rdata;
-    assign rt0_rresp[7*2-1:4*2]                           = mem1_s_rresp;
-    assign rt0_rlast[7:4] = mem1_s_rlast;
+            generate
+                if (SEXTMEM_ID_PAD_W > 0) begin : gen_id_pad
+                    assign mem_m_awid_z = {{SEXTMEM_ID_PAD_W{1'b0}}, mem_m_awid};
+                    assign mem_m_wid_z  = {{SEXTMEM_ID_PAD_W{1'b0}}, mem_m_wid};
+                    assign mem_m_arid_z = {{SEXTMEM_ID_PAD_W{1'b0}}, mem_m_arid};
+                end else begin : gen_id_nopad
+                    assign mem_m_awid_z = mem_m_awid;
+                    assign mem_m_wid_z  = mem_m_wid;
+                    assign mem_m_arid_z = mem_m_arid;
+                end
+            endgenerate
+            assign mem_m_bid    = mem_m_bid_z[MEM_MERGE_ID_W-1:0];
+            assign mem_m_rid    = mem_m_rid_z[MEM_MERGE_ID_W-1:0];
 
-    wire mem1_m_awvalid, mem1_m_wvalid, mem1_m_bvalid, mem1_m_arvalid, mem1_m_rvalid;
-    wire mem1_m_awready, mem1_m_wready, mem1_m_bready, mem1_m_arready, mem1_m_rready;
-    wire [MEM01_ID_W-1:0] mem1_m_awid, mem1_m_wid, mem1_m_bid, mem1_m_arid, mem1_m_rid;
-    wire [ADDR_WIDTH-1:0] mem1_m_awaddr, mem1_m_araddr;
-    wire [3:0] mem1_m_awlen, mem1_m_arlen;
-    wire [2:0] mem1_m_awsize, mem1_m_arsize;
-    wire [1:0] mem1_m_awburst, mem1_m_arburst, mem1_m_awlock, mem1_m_arlock;
-    wire [3:0] mem1_m_awcache, mem1_m_arcache;
-    wire [2:0] mem1_m_awprot, mem1_m_arprot;
-    wire [DATA_WIDTH_128-1:0] mem1_m_wdata, mem1_m_rdata;
-    wire [STRB_W128-1:0] mem1_m_wstrb;
-    wire mem1_m_wlast, mem1_m_rlast;
-    wire [1:0] mem1_m_bresp, mem1_m_rresp;
+            lbus_axi128_reg_slice_wrap #(
+                .ID_WIDTH(SEXTMEM_ID_WIDTH), .ADDR_WIDTH(ADDR_WIDTH_M), .DATA_WIDTH(128),
+                .AW_SLICE_EN(SEXT_AW_SLICE_EN), .W_SLICE_EN(SEXT_W_SLICE_EN),
+                .B_SLICE_EN(SEXT_B_SLICE_EN), .AR_SLICE_EN(SEXT_AR_SLICE_EN),
+                .R_SLICE_EN(SEXT_R_SLICE_EN)
+            ) u_sextmem_rs (
+                .aclk(aclk), .aresetn(aresetn),
+                .awvalid_s(mem_m_awvalid), .awready_s(mem_m_awready),
+                .awid_s(mem_m_awid_z), .awaddr_s(mem_m_awaddr), .awlen_s(mem_m_awlen),
+                .awsize_s(mem_m_awsize), .awburst_s(mem_m_awburst), .awlock_s(mem_m_awlock),
+                .awcache_s(mem_m_awcache), .awprot_s(mem_m_awprot),
+                .awvalid_m(sextmem_awvalid[mi]), .awready_m(sextmem_awready[mi]),
+                .awid_m(sextmem_awid[(mi*SEXTMEM_ID_WIDTH) +: SEXTMEM_ID_WIDTH]),
+                .awaddr_m(sextmem_awaddr[(mi*ADDR_WIDTH_M) +: ADDR_WIDTH_M]),
+                .awlen_m(sextmem_awlen[(mi*4) +: 4]),
+                .awsize_m(sextmem_awsize[(mi*3) +: 3]),
+                .awburst_m(sextmem_awburst[(mi*2) +: 2]),
+                .awlock_m(sextmem_awlock[(mi*2) +: 2]),
+                .awcache_m(sextmem_awcache[(mi*4) +: 4]),
+                .awprot_m(sextmem_awprot[(mi*3) +: 3]),
+                .wvalid_s(mem_m_wvalid), .wready_s(mem_m_wready),
+                .wid_s(mem_m_wid_z), .wdata_s(mem_m_wdata), .wstrb_s(mem_m_wstrb), .wlast_s(mem_m_wlast),
+                .wvalid_m(sextmem_wvalid[mi]), .wready_m(sextmem_wready[mi]),
+                .wid_m(sextmem_wid[(mi*SEXTMEM_ID_WIDTH) +: SEXTMEM_ID_WIDTH]),
+                .wdata_m(sextmem_wdata[(mi*128) +: 128]),
+                .wstrb_m(sextmem_wstrb[(mi*16) +: 16]),
+                .wlast_m(sextmem_wlast[mi]),
+                .bvalid_s(sextmem_bvalid[mi]), .bready_s(sextmem_bready[mi]),
+                .bid_s(sextmem_bid[(mi*SEXTMEM_ID_WIDTH) +: SEXTMEM_ID_WIDTH]),
+                .bresp_s(sextmem_bresp[(mi*2) +: 2]),
+                .bvalid_m(mem_m_bvalid), .bready_m(mem_m_bready),
+                .bid_m(mem_m_bid_z), .bresp_m(mem_m_bresp),
+                .arvalid_s(mem_m_arvalid), .arready_s(mem_m_arready),
+                .arid_s(mem_m_arid_z), .araddr_s(mem_m_araddr), .arlen_s(mem_m_arlen),
+                .arsize_s(mem_m_arsize), .arburst_s(mem_m_arburst), .arlock_s(mem_m_arlock),
+                .arcache_s(mem_m_arcache), .arprot_s(mem_m_arprot),
+                .arvalid_m(sextmem_arvalid[mi]), .arready_m(sextmem_arready[mi]),
+                .arid_m(sextmem_arid[(mi*SEXTMEM_ID_WIDTH) +: SEXTMEM_ID_WIDTH]),
+                .araddr_m(sextmem_araddr[(mi*ADDR_WIDTH_M) +: ADDR_WIDTH_M]),
+                .arlen_m(sextmem_arlen[(mi*4) +: 4]),
+                .arsize_m(sextmem_arsize[(mi*3) +: 3]),
+                .arburst_m(sextmem_arburst[(mi*2) +: 2]),
+                .arlock_m(sextmem_arlock[(mi*2) +: 2]),
+                .arcache_m(sextmem_arcache[(mi*4) +: 4]),
+                .arprot_m(sextmem_arprot[(mi*3) +: 3]),
+                .rvalid_s(sextmem_rvalid[mi]), .rready_s(sextmem_rready[mi]),
+                .rid_s(sextmem_rid[(mi*SEXTMEM_ID_WIDTH) +: SEXTMEM_ID_WIDTH]),
+                .rdata_s(sextmem_rdata[(mi*128) +: 128]),
+                .rresp_s(sextmem_rresp[(mi*2) +: 2]),
+                .rlast_s(sextmem_rlast[mi]),
+                .rvalid_m(mem_m_rvalid), .rready_m(mem_m_rready),
+                .rid_m(mem_m_rid_z), .rdata_m(mem_m_rdata), .rresp_m(mem_m_rresp),
+                .rlast_m(mem_m_rlast)
+            );
+        end
+    endgenerate
 
-    axi3_merge_Nto1_128 #(
-        .N(4), .IN_ID_WIDTH(MSR_ID_WIDTH), .SRC_ID_WIDTH(2)
-    ) u_merge_mem1 (
-        .aclk(aclk), .aresetn(aresetn),
-        .s_awvalid(mem1_s_awvalid), .s_awready(mem1_s_awready), .s_awid(mem1_s_awid),
-        .s_awaddr(mem1_s_awaddr), .s_awlen(mem1_s_awlen), .s_awsize(mem1_s_awsize),
-        .s_awburst(mem1_s_awburst), .s_awlock(mem1_s_awlock), .s_awcache(mem1_s_awcache),
-        .s_awprot(mem1_s_awprot),
-        .s_wvalid(mem1_s_wvalid), .s_wready(mem1_s_wready), .s_wid(mem1_s_wid),
-        .s_wdata(mem1_s_wdata), .s_wstrb(mem1_s_wstrb), .s_wlast(mem1_s_wlast),
-        .s_bvalid(mem1_s_bvalid), .s_bready(mem1_s_bready), .s_bid(mem1_s_bid),
-        .s_bresp(mem1_s_bresp),
-        .s_arvalid(mem1_s_arvalid), .s_arready(mem1_s_arready), .s_arid(mem1_s_arid),
-        .s_araddr(mem1_s_araddr), .s_arlen(mem1_s_arlen), .s_arsize(mem1_s_arsize),
-        .s_arburst(mem1_s_arburst), .s_arlock(mem1_s_arlock), .s_arcache(mem1_s_arcache),
-        .s_arprot(mem1_s_arprot),
-        .s_rvalid(mem1_s_rvalid), .s_rready(mem1_s_rready), .s_rid(mem1_s_rid),
-        .s_rdata(mem1_s_rdata), .s_rresp(mem1_s_rresp), .s_rlast(mem1_s_rlast),
-        .m_awvalid(mem1_m_awvalid), .m_awready(mem1_m_awready), .m_awid(mem1_m_awid),
-        .m_awaddr(mem1_m_awaddr), .m_awlen(mem1_m_awlen), .m_awsize(mem1_m_awsize),
-        .m_awburst(mem1_m_awburst), .m_awlock(mem1_m_awlock), .m_awcache(mem1_m_awcache),
-        .m_awprot(mem1_m_awprot),
-        .m_wvalid(mem1_m_wvalid), .m_wready(mem1_m_wready), .m_wid(mem1_m_wid),
-        .m_wdata(mem1_m_wdata), .m_wstrb(mem1_m_wstrb), .m_wlast(mem1_m_wlast),
-        .m_bvalid(mem1_m_bvalid), .m_bready(mem1_m_bready), .m_bid(mem1_m_bid),
-        .m_bresp(mem1_m_bresp),
-        .m_arvalid(mem1_m_arvalid), .m_arready(mem1_m_arready), .m_arid(mem1_m_arid),
-        .m_araddr(mem1_m_araddr), .m_arlen(mem1_m_arlen), .m_arsize(mem1_m_arsize),
-        .m_arburst(mem1_m_arburst), .m_arlock(mem1_m_arlock), .m_arcache(mem1_m_arcache),
-        .m_arprot(mem1_m_arprot),
-        .m_rvalid(mem1_m_rvalid), .m_rready(mem1_m_rready), .m_rid(mem1_m_rid),
-        .m_rdata(mem1_m_rdata), .m_rresp(mem1_m_rresp), .m_rlast(mem1_m_rlast)
-    );
+    // SRP8 (msrp[8]) bypass -> sextmem[BYPASS_IDX]
+    wire [SEXTMEM_ID_WIDTH-1:0] bp_awid_z;
+    wire [SEXTMEM_ID_WIDTH-1:0] bp_wid_z;
+    wire [SEXTMEM_ID_WIDTH-1:0] bp_bid_z;
+    wire [SEXTMEM_ID_WIDTH-1:0] bp_arid_z;
+    wire [SEXTMEM_ID_WIDTH-1:0] bp_rid_z;
+
+    assign bp_awid_z = {{SEXTMEM_BYPASS_PAD_W{1'b0}}, rt0_awid[(SRP_LAST*MSRP_ID_WIDTH) +: MSRP_ID_WIDTH]};
+    assign bp_wid_z  = {{SEXTMEM_BYPASS_PAD_W{1'b0}}, rt0_wid[(SRP_LAST*MSRP_ID_WIDTH) +: MSRP_ID_WIDTH]};
+    assign bp_arid_z = {{SEXTMEM_BYPASS_PAD_W{1'b0}}, rt0_arid[(SRP_LAST*MSRP_ID_WIDTH) +: MSRP_ID_WIDTH]};
+    assign rt0_bid[(SRP_LAST*MSRP_ID_WIDTH) +: MSRP_ID_WIDTH] =
+        bp_bid_z[MSRP_ID_WIDTH-1:0];
+    assign rt0_rid[(SRP_LAST*MSRP_ID_WIDTH) +: MSRP_ID_WIDTH] =
+        bp_rid_z[MSRP_ID_WIDTH-1:0];
 
     lbus_axi128_reg_slice_wrap #(
-        .ID_WIDTH(MEM01_ID_W), .ADDR_WIDTH(ADDR_WIDTH), .DATA_WIDTH(DATA_WIDTH_128),
-        .AW_SLICE_EN(SEXT_SLICE_EN), .W_SLICE_EN(SEXT_SLICE_EN), .B_SLICE_EN(SEXT_SLICE_EN),
-        .AR_SLICE_EN(SEXT_SLICE_EN), .R_SLICE_EN(SEXT_SLICE_EN)
-    ) u_sextmem1_rs (
+        .ID_WIDTH(SEXTMEM_ID_WIDTH), .ADDR_WIDTH(ADDR_WIDTH_M), .DATA_WIDTH(128),
+        .AW_SLICE_EN(SEXT_AW_SLICE_EN), .W_SLICE_EN(SEXT_W_SLICE_EN),
+        .B_SLICE_EN(SEXT_B_SLICE_EN), .AR_SLICE_EN(SEXT_AR_SLICE_EN),
+        .R_SLICE_EN(SEXT_R_SLICE_EN)
+    ) u_sextmem_bypass_rs (
         .aclk(aclk), .aresetn(aresetn),
-        .awvalid_s(mem1_m_awvalid), .awready_s(mem1_m_awready),
-        .awid_s(mem1_m_awid), .awaddr_s(mem1_m_awaddr), .awlen_s(mem1_m_awlen),
-        .awsize_s(mem1_m_awsize), .awburst_s(mem1_m_awburst), .awlock_s(mem1_m_awlock),
-        .awcache_s(mem1_m_awcache), .awprot_s(mem1_m_awprot),
-        .awvalid_m(sextmem1_awvalid), .awready_m(sextmem1_awready),
-        .awid_m(sextmem1_awid), .awaddr_m(sextmem1_awaddr), .awlen_m(sextmem1_awlen),
-        .awsize_m(sextmem1_awsize), .awburst_m(sextmem1_awburst), .awlock_m(sextmem1_awlock),
-        .awcache_m(sextmem1_awcache), .awprot_m(sextmem1_awprot),
-        .wvalid_s(mem1_m_wvalid), .wready_s(mem1_m_wready),
-        .wid_s(mem1_m_wid), .wdata_s(mem1_m_wdata), .wstrb_s(mem1_m_wstrb), .wlast_s(mem1_m_wlast),
-        .wvalid_m(sextmem1_wvalid), .wready_m(sextmem1_wready),
-        .wid_m(sextmem1_wid), .wdata_m(sextmem1_wdata), .wstrb_m(sextmem1_wstrb),
-        .wlast_m(sextmem1_wlast),
-        .bvalid_s(sextmem1_bvalid), .bready_s(sextmem1_bready),
-        .bid_s(sextmem1_bid), .bresp_s(sextmem1_bresp),
-        .bvalid_m(mem1_m_bvalid), .bready_m(mem1_m_bready),
-        .bid_m(mem1_m_bid), .bresp_m(mem1_m_bresp),
-        .arvalid_s(mem1_m_arvalid), .arready_s(mem1_m_arready),
-        .arid_s(mem1_m_arid), .araddr_s(mem1_m_araddr), .arlen_s(mem1_m_arlen),
-        .arsize_s(mem1_m_arsize), .arburst_s(mem1_m_arburst), .arlock_s(mem1_m_arlock),
-        .arcache_s(mem1_m_arcache), .arprot_s(mem1_m_arprot),
-        .arvalid_m(sextmem1_arvalid), .arready_m(sextmem1_arready),
-        .arid_m(sextmem1_arid), .araddr_m(sextmem1_araddr), .arlen_m(sextmem1_arlen),
-        .arsize_m(sextmem1_arsize), .arburst_m(sextmem1_arburst), .arlock_m(sextmem1_arlock),
-        .arcache_m(sextmem1_arcache), .arprot_m(sextmem1_arprot),
-        .rvalid_s(sextmem1_rvalid), .rready_s(sextmem1_rready),
-        .rid_s(sextmem1_rid), .rdata_s(sextmem1_rdata), .rresp_s(sextmem1_rresp),
-        .rlast_s(sextmem1_rlast),
-        .rvalid_m(mem1_m_rvalid), .rready_m(mem1_m_rready),
-        .rid_m(mem1_m_rid), .rdata_m(mem1_m_rdata), .rresp_m(mem1_m_rresp),
-        .rlast_m(mem1_m_rlast)
+        .awvalid_s(rt0_awvalid[SRP_LAST]), .awready_s(rt0_awready[SRP_LAST]),
+        .awid_s(bp_awid_z),
+        .awaddr_s(rt0_awaddr[(SRP_LAST*ADDR_WIDTH_M) +: ADDR_WIDTH_M]),
+        .awlen_s(rt0_awlen[(SRP_LAST*4) +: 4]),
+        .awsize_s(rt0_awsize[(SRP_LAST*3) +: 3]),
+        .awburst_s(rt0_awburst[(SRP_LAST*2) +: 2]),
+        .awlock_s(rt0_awlock[(SRP_LAST*2) +: 2]),
+        .awcache_s(rt0_awcache[(SRP_LAST*4) +: 4]),
+        .awprot_s(rt0_awprot[(SRP_LAST*3) +: 3]),
+        .awvalid_m(sextmem_awvalid[BYPASS_IDX]), .awready_m(sextmem_awready[BYPASS_IDX]),
+        .awid_m(sextmem_awid[(BYPASS_IDX*SEXTMEM_ID_WIDTH) +: SEXTMEM_ID_WIDTH]),
+        .awaddr_m(sextmem_awaddr[(BYPASS_IDX*ADDR_WIDTH_M) +: ADDR_WIDTH_M]),
+        .awlen_m(sextmem_awlen[(BYPASS_IDX*4) +: 4]),
+        .awsize_m(sextmem_awsize[(BYPASS_IDX*3) +: 3]),
+        .awburst_m(sextmem_awburst[(BYPASS_IDX*2) +: 2]),
+        .awlock_m(sextmem_awlock[(BYPASS_IDX*2) +: 2]),
+        .awcache_m(sextmem_awcache[(BYPASS_IDX*4) +: 4]),
+        .awprot_m(sextmem_awprot[(BYPASS_IDX*3) +: 3]),
+        .wvalid_s(rt0_wvalid[SRP_LAST]), .wready_s(rt0_wready[SRP_LAST]),
+        .wid_s(bp_wid_z),
+        .wdata_s(rt0_wdata[(SRP_LAST*128) +: 128]),
+        .wstrb_s(rt0_wstrb[(SRP_LAST*16) +: 16]),
+        .wlast_s(rt0_wlast[SRP_LAST]),
+        .wvalid_m(sextmem_wvalid[BYPASS_IDX]), .wready_m(sextmem_wready[BYPASS_IDX]),
+        .wid_m(sextmem_wid[(BYPASS_IDX*SEXTMEM_ID_WIDTH) +: SEXTMEM_ID_WIDTH]),
+        .wdata_m(sextmem_wdata[(BYPASS_IDX*128) +: 128]),
+        .wstrb_m(sextmem_wstrb[(BYPASS_IDX*16) +: 16]),
+        .wlast_m(sextmem_wlast[BYPASS_IDX]),
+        .bvalid_s(sextmem_bvalid[BYPASS_IDX]), .bready_s(sextmem_bready[BYPASS_IDX]),
+        .bid_s(sextmem_bid[(BYPASS_IDX*SEXTMEM_ID_WIDTH) +: SEXTMEM_ID_WIDTH]),
+        .bresp_s(sextmem_bresp[(BYPASS_IDX*2) +: 2]),
+        .bvalid_m(rt0_bvalid[SRP_LAST]), .bready_m(rt0_bready[SRP_LAST]),
+        .bid_m(bp_bid_z), .bresp_m(rt0_bresp[(SRP_LAST*2) +: 2]),
+        .arvalid_s(rt0_arvalid[SRP_LAST]), .arready_s(rt0_arready[SRP_LAST]),
+        .arid_s(bp_arid_z),
+        .araddr_s(rt0_araddr[(SRP_LAST*ADDR_WIDTH_M) +: ADDR_WIDTH_M]),
+        .arlen_s(rt0_arlen[(SRP_LAST*4) +: 4]),
+        .arsize_s(rt0_arsize[(SRP_LAST*3) +: 3]),
+        .arburst_s(rt0_arburst[(SRP_LAST*2) +: 2]),
+        .arlock_s(rt0_arlock[(SRP_LAST*2) +: 2]),
+        .arcache_s(rt0_arcache[(SRP_LAST*4) +: 4]),
+        .arprot_s(rt0_arprot[(SRP_LAST*3) +: 3]),
+        .arvalid_m(sextmem_arvalid[BYPASS_IDX]), .arready_m(sextmem_arready[BYPASS_IDX]),
+        .arid_m(sextmem_arid[(BYPASS_IDX*SEXTMEM_ID_WIDTH) +: SEXTMEM_ID_WIDTH]),
+        .araddr_m(sextmem_araddr[(BYPASS_IDX*ADDR_WIDTH_M) +: ADDR_WIDTH_M]),
+        .arlen_m(sextmem_arlen[(BYPASS_IDX*4) +: 4]),
+        .arsize_m(sextmem_arsize[(BYPASS_IDX*3) +: 3]),
+        .arburst_m(sextmem_arburst[(BYPASS_IDX*2) +: 2]),
+        .arlock_m(sextmem_arlock[(BYPASS_IDX*2) +: 2]),
+        .arcache_m(sextmem_arcache[(BYPASS_IDX*4) +: 4]),
+        .arprot_m(sextmem_arprot[(BYPASS_IDX*3) +: 3]),
+        .rvalid_s(sextmem_rvalid[BYPASS_IDX]), .rready_s(sextmem_rready[BYPASS_IDX]),
+        .rid_s(sextmem_rid[(BYPASS_IDX*SEXTMEM_ID_WIDTH) +: SEXTMEM_ID_WIDTH]),
+        .rdata_s(sextmem_rdata[(BYPASS_IDX*128) +: 128]),
+        .rresp_s(sextmem_rresp[(BYPASS_IDX*2) +: 2]),
+        .rlast_s(sextmem_rlast[BYPASS_IDX]),
+        .rvalid_m(rt0_rvalid[SRP_LAST]), .rready_m(rt0_rready[SRP_LAST]),
+        .rid_m(bp_rid_z),
+        .rdata_m(rt0_rdata[(SRP_LAST*128) +: 128]),
+        .rresp_m(rt0_rresp[(SRP_LAST*2) +: 2]),
+        .rlast_m(rt0_rlast[SRP_LAST])
     );
 
-    // msrp8 bypass -> sextmem2
-    lbus_axi128_reg_slice_wrap #(
-        .ID_WIDTH(MSR_ID_WIDTH), .ADDR_WIDTH(ADDR_WIDTH), .DATA_WIDTH(DATA_WIDTH_128),
-        .AW_SLICE_EN(SEXT_SLICE_EN), .W_SLICE_EN(SEXT_SLICE_EN), .B_SLICE_EN(SEXT_SLICE_EN),
-        .AR_SLICE_EN(SEXT_SLICE_EN), .R_SLICE_EN(SEXT_SLICE_EN)
-    ) u_sextmem2_rs (
-        .aclk(aclk), .aresetn(aresetn),
-        .awvalid_s(rt0_awvalid[8]), .awready_s(rt0_awready[8]),
-        .awid_s(rt0_awid[8*MSR_ID_WIDTH-1:7*MSR_ID_WIDTH]),
-        .awaddr_s(rt0_awaddr[8*ADDR_WIDTH-1:7*ADDR_WIDTH]),
-        .awlen_s(rt0_awlen[8*4-1:7*4]), .awsize_s(rt0_awsize[8*3-1:7*3]),
-        .awburst_s(rt0_awburst[8*2-1:7*2]), .awlock_s(rt0_awlock[8*2-1:7*2]),
-        .awcache_s(rt0_awcache[8*4-1:7*4]), .awprot_s(rt0_awprot[8*3-1:7*3]),
-        .awvalid_m(sextmem2_awvalid), .awready_m(sextmem2_awready),
-        .awid_m(sextmem2_awid), .awaddr_m(sextmem2_awaddr), .awlen_m(sextmem2_awlen),
-        .awsize_m(sextmem2_awsize), .awburst_m(sextmem2_awburst), .awlock_m(sextmem2_awlock),
-        .awcache_m(sextmem2_awcache), .awprot_m(sextmem2_awprot),
-        .wvalid_s(rt0_wvalid[8]), .wready_s(rt0_wready[8]),
-        .wid_s(rt0_wid[8*MSR_ID_WIDTH-1:7*MSR_ID_WIDTH]),
-        .wdata_s(rt0_wdata[8*DATA_WIDTH_128-1:7*DATA_WIDTH_128]),
-        .wstrb_s(rt0_wstrb[8*STRB_W128-1:7*STRB_W128]), .wlast_s(rt0_wlast[8]),
-        .wvalid_m(sextmem2_wvalid), .wready_m(sextmem2_wready),
-        .wid_m(sextmem2_wid), .wdata_m(sextmem2_wdata), .wstrb_m(sextmem2_wstrb),
-        .wlast_m(sextmem2_wlast),
-        .bvalid_s(sextmem2_bvalid), .bready_s(sextmem2_bready),
-        .bid_s(sextmem2_bid), .bresp_s(sextmem2_bresp),
-        .bvalid_m(rt0_bvalid[8]), .bready_m(rt0_bready[8]),
-        .bid_m(rt0_bid[8*MSR_ID_WIDTH-1:7*MSR_ID_WIDTH]),
-        .bresp_m(rt0_bresp[8*2-1:7*2]),
-        .arvalid_s(rt0_arvalid[8]), .arready_s(rt0_arready[8]),
-        .arid_s(rt0_arid[8*MSR_ID_WIDTH-1:7*MSR_ID_WIDTH]),
-        .araddr_s(rt0_araddr[8*ADDR_WIDTH-1:7*ADDR_WIDTH]),
-        .arlen_s(rt0_arlen[8*4-1:7*4]), .arsize_s(rt0_arsize[8*3-1:7*3]),
-        .arburst_s(rt0_arburst[8*2-1:7*2]), .arlock_s(rt0_arlock[8*2-1:7*2]),
-        .arcache_s(rt0_arcache[8*4-1:7*4]), .arprot_s(rt0_arprot[8*3-1:7*3]),
-        .arvalid_m(sextmem2_arvalid), .arready_m(sextmem2_arready),
-        .arid_m(sextmem2_arid), .araddr_m(sextmem2_araddr), .arlen_m(sextmem2_arlen),
-        .arsize_m(sextmem2_arsize), .arburst_m(sextmem2_arburst), .arlock_m(sextmem2_arlock),
-        .arcache_m(sextmem2_arcache), .arprot_m(sextmem2_arprot),
-        .rvalid_s(sextmem2_rvalid), .rready_s(sextmem2_rready),
-        .rid_s(sextmem2_rid), .rdata_s(sextmem2_rdata), .rresp_s(sextmem2_rresp),
-        .rlast_s(sextmem2_rlast),
-        .rvalid_m(rt0_rvalid[8]), .rready_m(rt0_rready[8]),
-        .rid_m(rt0_rid[8*MSR_ID_WIDTH-1:7*MSR_ID_WIDTH]),
-        .rdata_m(rt0_rdata[8*DATA_WIDTH_128-1:7*DATA_WIDTH_128]),
-        .rresp_m(rt0_rresp[8*2-1:7*2]), .rlast_m(rt0_rlast[8])
-    );
-
-    // Target1: msrp0~8 -> sextio0
+    // Target1 (io): msrp[0..8] -> io 9:1 merge -> sextio
     wire mem_io_m_awvalid, mem_io_m_wvalid, mem_io_m_bvalid, mem_io_m_arvalid, mem_io_m_rvalid;
     wire mem_io_m_awready, mem_io_m_wready, mem_io_m_bready, mem_io_m_arready, mem_io_m_rready;
-    wire [IO_ID_W-1:0] mem_io_m_awid, mem_io_m_wid, mem_io_m_bid, mem_io_m_arid, mem_io_m_rid;
-    wire [ADDR_WIDTH-1:0] mem_io_m_awaddr, mem_io_m_araddr;
+    wire [SEXTIO_ID_WIDTH-1:0] mem_io_m_awid, mem_io_m_wid, mem_io_m_bid, mem_io_m_arid, mem_io_m_rid;
+    wire [ADDR_WIDTH_M-1:0] mem_io_m_awaddr, mem_io_m_araddr;
     wire [3:0] mem_io_m_awlen, mem_io_m_arlen;
     wire [2:0] mem_io_m_awsize, mem_io_m_arsize;
     wire [1:0] mem_io_m_awburst, mem_io_m_arburst, mem_io_m_awlock, mem_io_m_arlock;
     wire [3:0] mem_io_m_awcache, mem_io_m_arcache;
     wire [2:0] mem_io_m_awprot, mem_io_m_arprot;
-    wire [DATA_WIDTH_128-1:0] mem_io_m_wdata, mem_io_m_rdata;
-    wire [STRB_W128-1:0] mem_io_m_wstrb;
+    wire [127:0] mem_io_m_wdata, mem_io_m_rdata;
+    wire [15:0]  mem_io_m_wstrb;
     wire mem_io_m_wlast, mem_io_m_rlast;
     wire [1:0] mem_io_m_bresp, mem_io_m_rresp;
 
     axi3_merge_Nto1_128 #(
-        .N(9), .IN_ID_WIDTH(MSR_ID_WIDTH), .SRC_ID_WIDTH(4)
-    ) u_merge_io (
+        .N(NUM_SRP),
+        .ADDR_WIDTH(ADDR_WIDTH_M),
+        .IN_ID_WIDTH(MSRP_ID_WIDTH),
+        .WR_OUTSTANDING_DEPTH(MSRP_WR_PENDING_DEPTH),
+        .SRC_ID_WIDTH(IO_MERGE_TAG_W)
+    ) u_io_merge (
         .aclk(aclk), .aresetn(aresetn),
         .s_awvalid(rt1_awvalid), .s_awready(rt1_awready), .s_awid(rt1_awid),
         .s_awaddr(rt1_awaddr), .s_awlen(rt1_awlen), .s_awsize(rt1_awsize),
@@ -967,116 +917,197 @@ module lbus_srps #(
     );
 
     lbus_axi128_reg_slice_wrap #(
-        .ID_WIDTH(IO_ID_W), .ADDR_WIDTH(ADDR_WIDTH), .DATA_WIDTH(DATA_WIDTH_128),
-        .AW_SLICE_EN(SEXT_SLICE_EN), .W_SLICE_EN(SEXT_SLICE_EN), .B_SLICE_EN(SEXT_SLICE_EN),
-        .AR_SLICE_EN(SEXT_SLICE_EN), .R_SLICE_EN(SEXT_SLICE_EN)
-    ) u_sextio0_rs (
+        .ID_WIDTH(SEXTIO_ID_WIDTH), .ADDR_WIDTH(ADDR_WIDTH_M), .DATA_WIDTH(128),
+        .AW_SLICE_EN(SEXT_AW_SLICE_EN), .W_SLICE_EN(SEXT_W_SLICE_EN),
+        .B_SLICE_EN(SEXT_B_SLICE_EN), .AR_SLICE_EN(SEXT_AR_SLICE_EN),
+        .R_SLICE_EN(SEXT_R_SLICE_EN)
+    ) u_sextio_rs (
         .aclk(aclk), .aresetn(aresetn),
         .awvalid_s(mem_io_m_awvalid), .awready_s(mem_io_m_awready),
         .awid_s(mem_io_m_awid), .awaddr_s(mem_io_m_awaddr), .awlen_s(mem_io_m_awlen),
         .awsize_s(mem_io_m_awsize), .awburst_s(mem_io_m_awburst), .awlock_s(mem_io_m_awlock),
         .awcache_s(mem_io_m_awcache), .awprot_s(mem_io_m_awprot),
-        .awvalid_m(sextio0_awvalid), .awready_m(sextio0_awready),
-        .awid_m(sextio0_awid), .awaddr_m(sextio0_awaddr), .awlen_m(sextio0_awlen),
-        .awsize_m(sextio0_awsize), .awburst_m(sextio0_awburst), .awlock_m(sextio0_awlock),
-        .awcache_m(sextio0_awcache), .awprot_m(sextio0_awprot),
+        .awvalid_m(sextio_awvalid), .awready_m(sextio_awready),
+        .awid_m(sextio_awid), .awaddr_m(sextio_awaddr), .awlen_m(sextio_awlen),
+        .awsize_m(sextio_awsize), .awburst_m(sextio_awburst), .awlock_m(sextio_awlock),
+        .awcache_m(sextio_awcache), .awprot_m(sextio_awprot),
         .wvalid_s(mem_io_m_wvalid), .wready_s(mem_io_m_wready),
         .wid_s(mem_io_m_wid), .wdata_s(mem_io_m_wdata), .wstrb_s(mem_io_m_wstrb),
         .wlast_s(mem_io_m_wlast),
-        .wvalid_m(sextio0_wvalid), .wready_m(sextio0_wready),
-        .wid_m(sextio0_wid), .wdata_m(sextio0_wdata), .wstrb_m(sextio0_wstrb),
-        .wlast_m(sextio0_wlast),
-        .bvalid_s(sextio0_bvalid), .bready_s(sextio0_bready),
-        .bid_s(sextio0_bid), .bresp_s(sextio0_bresp),
+        .wvalid_m(sextio_wvalid), .wready_m(sextio_wready),
+        .wid_m(sextio_wid), .wdata_m(sextio_wdata), .wstrb_m(sextio_wstrb),
+        .wlast_m(sextio_wlast),
+        .bvalid_s(sextio_bvalid), .bready_s(sextio_bready),
+        .bid_s(sextio_bid), .bresp_s(sextio_bresp),
         .bvalid_m(mem_io_m_bvalid), .bready_m(mem_io_m_bready),
         .bid_m(mem_io_m_bid), .bresp_m(mem_io_m_bresp),
         .arvalid_s(mem_io_m_arvalid), .arready_s(mem_io_m_arready),
         .arid_s(mem_io_m_arid), .araddr_s(mem_io_m_araddr), .arlen_s(mem_io_m_arlen),
         .arsize_s(mem_io_m_arsize), .arburst_s(mem_io_m_arburst), .arlock_s(mem_io_m_arlock),
         .arcache_s(mem_io_m_arcache), .arprot_s(mem_io_m_arprot),
-        .arvalid_m(sextio0_arvalid), .arready_m(sextio0_arready),
-        .arid_m(sextio0_arid), .araddr_m(sextio0_araddr), .arlen_m(sextio0_arlen),
-        .arsize_m(sextio0_arsize), .arburst_m(sextio0_arburst), .arlock_m(sextio0_arlock),
-        .arcache_m(sextio0_arcache), .arprot_m(sextio0_arprot),
-        .rvalid_s(sextio0_rvalid), .rready_s(sextio0_rready),
-        .rid_s(sextio0_rid), .rdata_s(sextio0_rdata), .rresp_s(sextio0_rresp),
-        .rlast_s(sextio0_rlast),
+        .arvalid_m(sextio_arvalid), .arready_m(sextio_arready),
+        .arid_m(sextio_arid), .araddr_m(sextio_araddr), .arlen_m(sextio_arlen),
+        .arsize_m(sextio_arsize), .arburst_m(sextio_arburst), .arlock_m(sextio_arlock),
+        .arcache_m(sextio_arcache), .arprot_m(sextio_arprot),
+        .rvalid_s(sextio_rvalid), .rready_s(sextio_rready),
+        .rid_s(sextio_rid), .rdata_s(sextio_rdata), .rresp_s(sextio_rresp),
+        .rlast_s(sextio_rlast),
         .rvalid_m(mem_io_m_rvalid), .rready_m(mem_io_m_rready),
         .rid_m(mem_io_m_rid), .rdata_m(mem_io_m_rdata), .rresp_m(mem_io_m_rresp),
         .rlast_m(mem_io_m_rlast)
     );
 
-    // mext0 -> reg slice -> router/AHB -> ssrp0~8
+    // mext -> reg slice -> router/AHB -> ssrp
     wire mext_rt_awvalid, mext_rt_wvalid, mext_rt_bvalid, mext_rt_arvalid, mext_rt_rvalid;
     wire mext_rt_awready, mext_rt_wready, mext_rt_bready, mext_rt_arready, mext_rt_rready;
     wire [MEXT_ID_WIDTH-1:0] mext_rt_awid, mext_rt_wid, mext_rt_bid, mext_rt_arid, mext_rt_rid;
-    wire [ADDR_WIDTH-1:0] mext_rt_awaddr, mext_rt_araddr;
+    wire [ADDR_WIDTH_S-1:0] mext_rt_awaddr, mext_rt_araddr;
     wire [3:0] mext_rt_awlen, mext_rt_arlen;
     wire [2:0] mext_rt_awsize, mext_rt_arsize;
     wire [1:0] mext_rt_awburst, mext_rt_arburst, mext_rt_awlock, mext_rt_arlock;
     wire [3:0] mext_rt_awcache, mext_rt_arcache;
     wire [2:0] mext_rt_awprot, mext_rt_arprot;
-    wire [DATA_WIDTH_32-1:0] mext_rt_wdata, mext_rt_rdata;
-    wire [STRB_W32-1:0] mext_rt_wstrb;
+    wire [31:0] mext_rt_wdata, mext_rt_rdata;
+    wire [3:0]  mext_rt_wstrb;
     wire mext_rt_wlast, mext_rt_rlast;
     wire [1:0] mext_rt_bresp, mext_rt_rresp;
+    wire [NUM_SRP-1:0] mext_rt_aw_sel, mext_rt_ar_sel;
+    wire [ADDR_WIDTH_S-1:0] mext_awaddr_map, mext_araddr_map;
+    wire [ADDR_WIDTH_S-1:0] mext_rt_awaddr_tgt, mext_rt_araddr_tgt;
 
-    lbus_axi32_reg_slice_wrap #(
-        .ID_WIDTH(MEXT_ID_WIDTH), .ADDR_WIDTH(ADDR_WIDTH), .DATA_WIDTH(DATA_WIDTH_32),
-        .AW_SLICE_EN(MEXT_SLICE_EN), .W_SLICE_EN(MEXT_SLICE_EN), .B_SLICE_EN(MEXT_SLICE_EN),
-        .AR_SLICE_EN(MEXT_SLICE_EN), .R_SLICE_EN(MEXT_SLICE_EN)
-    ) u_mext0_rs (
+    localparam integer MEXT_AW_P = MEXT_ID_WIDTH + ADDR_WIDTH_S + 4 + 3 + 2 + 2 + 4 + 3;
+    localparam integer MEXT_AR_P = MEXT_ID_WIDTH + ADDR_WIDTH_S + 4 + 3 + 2 + 2 + 4 + 3;
+    localparam integer MEXT_W_P  = MEXT_ID_WIDTH + 32 + 4 + 1;
+    localparam integer MEXT_B_P  = MEXT_ID_WIDTH + 2;
+    localparam integer MEXT_R_P  = MEXT_ID_WIDTH + 32 + 2 + 1;
+
+    wire [MEXT_AW_P-1:0] mext_aw_pld_s, mext_aw_pld_m;
+    wire [MEXT_W_P-1:0]  mext_w_pld_s,  mext_w_pld_m;
+    wire [MEXT_B_P-1:0]  mext_b_pld_s,  mext_b_pld_m;
+    wire [MEXT_AR_P-1:0] mext_ar_pld_s, mext_ar_pld_m;
+    wire [MEXT_R_P-1:0]  mext_r_pld_s,  mext_r_pld_m;
+
+    assign mext_aw_pld_s = {mext_awprot, mext_awcache, mext_awlock, mext_awburst, mext_awsize,
+                            mext_awlen, mext_awaddr_map, mext_awid};
+    assign {mext_rt_awprot, mext_rt_awcache, mext_rt_awlock, mext_rt_awburst, mext_rt_awsize,
+            mext_rt_awlen, mext_rt_awaddr, mext_rt_awid} = mext_aw_pld_m;
+
+    assign mext_w_pld_s = {mext_wlast, mext_wstrb, mext_wdata, mext_wid};
+    assign {mext_rt_wlast, mext_rt_wstrb, mext_rt_wdata, mext_rt_wid} = mext_w_pld_m;
+
+    assign mext_b_pld_s = {mext_rt_bresp, mext_rt_bid};
+    assign {mext_bresp, mext_bid} = mext_b_pld_m;
+
+    assign mext_ar_pld_s = {mext_arprot, mext_arcache, mext_arlock, mext_arburst, mext_arsize,
+                            mext_arlen, mext_araddr_map, mext_arid};
+    assign {mext_rt_arprot, mext_rt_arcache, mext_rt_arlock, mext_rt_arburst, mext_rt_arsize,
+            mext_rt_arlen, mext_rt_araddr, mext_rt_arid} = mext_ar_pld_m;
+
+    assign mext_r_pld_s = {mext_rt_rlast, mext_rt_rresp, mext_rt_rdata, mext_rt_rid};
+    assign {mext_rlast, mext_rresp, mext_rdata, mext_rid} = mext_r_pld_m;
+
+    axi3_ahb_region_sel #(
+        .N_PORTS(NUM_SRP),
+        .ADDR_WIDTH(ADDR_WIDTH_S),
+        .REGION_SIZE_KB(AHB_REGION_SIZE_KB)
+    ) u_mext_awaddr_map (
+        .addr(mext_awaddr),
+        .sel(),
+        .addr_map(mext_awaddr_map),
+        .addr_tgt()
+    );
+
+    axi3_ahb_region_sel #(
+        .N_PORTS(NUM_SRP),
+        .ADDR_WIDTH(ADDR_WIDTH_S),
+        .REGION_SIZE_KB(AHB_REGION_SIZE_KB)
+    ) u_mext_araddr_map (
+        .addr(mext_araddr),
+        .sel(),
+        .addr_map(mext_araddr_map),
+        .addr_tgt()
+    );
+
+    axi3_reg_slice_ch #(
+        .PAYLOAD_WIDTH(MEXT_AW_P),
+        .ENABLE(MEXT_AW_SLICE_EN)
+    ) u_mext_aw_slice (
         .aclk(aclk), .aresetn(aresetn),
-        .awvalid_s(mext0_awvalid), .awready_s(mext0_awready),
-        .awid_s(mext0_awid), .awaddr_s(mext0_awaddr), .awlen_s(mext0_awlen),
-        .awsize_s(mext0_awsize), .awburst_s(mext0_awburst), .awlock_s(mext0_awlock),
-        .awcache_s(mext0_awcache), .awprot_s(mext0_awprot),
-        .awvalid_m(mext_rt_awvalid), .awready_m(mext_rt_awready),
-        .awid_m(mext_rt_awid), .awaddr_m(mext_rt_awaddr), .awlen_m(mext_rt_awlen),
-        .awsize_m(mext_rt_awsize), .awburst_m(mext_rt_awburst), .awlock_m(mext_rt_awlock),
-        .awcache_m(mext_rt_awcache), .awprot_m(mext_rt_awprot),
-        .wvalid_s(mext0_wvalid), .wready_s(mext0_wready),
-        .wid_s(mext0_wid), .wdata_s(mext0_wdata), .wstrb_s(mext0_wstrb), .wlast_s(mext0_wlast),
-        .wvalid_m(mext_rt_wvalid), .wready_m(mext_rt_wready),
-        .wid_m(mext_rt_wid), .wdata_m(mext_rt_wdata), .wstrb_m(mext_rt_wstrb),
-        .wlast_m(mext_rt_wlast),
-        .bvalid_s(mext_rt_bvalid), .bready_s(mext_rt_bready),
-        .bid_s(mext_rt_bid), .bresp_s(mext_rt_bresp),
-        .bvalid_m(mext0_bvalid), .bready_m(mext0_bready),
-        .bid_m(mext0_bid), .bresp_m(mext0_bresp),
-        .arvalid_s(mext0_arvalid), .arready_s(mext0_arready),
-        .arid_s(mext0_arid), .araddr_s(mext0_araddr), .arlen_s(mext0_arlen),
-        .arsize_s(mext0_arsize), .arburst_s(mext0_arburst), .arlock_s(mext0_arlock),
-        .arcache_s(mext0_arcache), .arprot_s(mext0_arprot),
-        .arvalid_m(mext_rt_arvalid), .arready_m(mext_rt_arready),
-        .arid_m(mext_rt_arid), .araddr_m(mext_rt_araddr), .arlen_m(mext_rt_arlen),
-        .arsize_m(mext_rt_arsize), .arburst_m(mext_rt_arburst), .arlock_m(mext_rt_arlock),
-        .arcache_m(mext_rt_arcache), .arprot_m(mext_rt_arprot),
-        .rvalid_s(mext_rt_rvalid), .rready_s(mext_rt_rready),
-        .rid_s(mext_rt_rid), .rdata_s(mext_rt_rdata), .rresp_s(mext_rt_rresp),
-        .rlast_s(mext_rt_rlast),
-        .rvalid_m(mext0_rvalid), .rready_m(mext0_rready),
-        .rid_m(mext0_rid), .rdata_m(mext0_rdata), .rresp_m(mext0_rresp),
-        .rlast_m(mext0_rlast)
+        .valid_s(mext_awvalid), .ready_s(mext_awready), .payload_s(mext_aw_pld_s),
+        .valid_m(mext_rt_awvalid), .ready_m(mext_rt_awready), .payload_m(mext_aw_pld_m)
+    );
+
+    axi3_reg_slice_ch #(
+        .PAYLOAD_WIDTH(MEXT_W_P),
+        .ENABLE(MEXT_W_SLICE_EN)
+    ) u_mext_w_slice (
+        .aclk(aclk), .aresetn(aresetn),
+        .valid_s(mext_wvalid), .ready_s(mext_wready), .payload_s(mext_w_pld_s),
+        .valid_m(mext_rt_wvalid), .ready_m(mext_rt_wready), .payload_m(mext_w_pld_m)
+    );
+
+    axi3_reg_slice_ch #(
+        .PAYLOAD_WIDTH(MEXT_B_P),
+        .ENABLE(MEXT_B_SLICE_EN)
+    ) u_mext_b_slice (
+        .aclk(aclk), .aresetn(aresetn),
+        .valid_s(mext_rt_bvalid), .ready_s(mext_rt_bready), .payload_s(mext_b_pld_s),
+        .valid_m(mext_bvalid), .ready_m(mext_bready), .payload_m(mext_b_pld_m)
+    );
+
+    axi3_reg_slice_ch #(
+        .PAYLOAD_WIDTH(MEXT_AR_P),
+        .ENABLE(MEXT_AR_SLICE_EN)
+    ) u_mext_ar_slice (
+        .aclk(aclk), .aresetn(aresetn),
+        .valid_s(mext_arvalid), .ready_s(mext_arready), .payload_s(mext_ar_pld_s),
+        .valid_m(mext_rt_arvalid), .ready_m(mext_rt_arready), .payload_m(mext_ar_pld_m)
+    );
+
+    axi3_reg_slice_ch #(
+        .PAYLOAD_WIDTH(MEXT_R_P),
+        .ENABLE(MEXT_R_SLICE_EN)
+    ) u_mext_r_slice (
+        .aclk(aclk), .aresetn(aresetn),
+        .valid_s(mext_rt_rvalid), .ready_s(mext_rt_rready), .payload_s(mext_r_pld_s),
+        .valid_m(mext_rvalid), .ready_m(mext_rready), .payload_m(mext_r_pld_m)
+    );
+
+    axi3_ahb_region_sel #(
+        .N_PORTS(NUM_SRP),
+        .ADDR_WIDTH(ADDR_WIDTH_S),
+        .REGION_SIZE_KB(AHB_REGION_SIZE_KB)
+    ) u_mext_aw_region_sel (
+        .addr(mext_rt_awaddr),
+        .sel(mext_rt_aw_sel),
+        .addr_map(),
+        .addr_tgt(mext_rt_awaddr_tgt)
+    );
+
+    axi3_ahb_region_sel #(
+        .N_PORTS(NUM_SRP),
+        .ADDR_WIDTH(ADDR_WIDTH_S),
+        .REGION_SIZE_KB(AHB_REGION_SIZE_KB)
+    ) u_mext_ar_region_sel (
+        .addr(mext_rt_araddr),
+        .sel(mext_rt_ar_sel),
+        .addr_map(),
+        .addr_tgt(mext_rt_araddr_tgt)
     );
 
     axi3_router_1toN_ahblite #(
-        .N(9),
-        .ADDR_WIDTH(ADDR_WIDTH),
-        .HADDR_LOW_BITS(HADDR_LOW_BITS),
-        .DATA_WIDTH(DATA_WIDTH_32),
-        .STRB_WIDTH(STRB_W32),
+        .N(NUM_SRP),
+        .ADDR_WIDTH(ADDR_WIDTH_S),
         .ID_WIDTH(MEXT_ID_WIDTH),
         .ROUTER_OUTSTANDING(ROUTER_OUTSTANDING),
         .WR_CMD_DEPTH(WR_CMD_DEPTH),
         .RD_CMD_DEPTH(RD_CMD_DEPTH),
-        .RESP_DEPTH(RESP_DEPTH),
-        .BUSY_ENABLE(BUSY_ENABLE)
+        .RESP_DEPTH(RESP_DEPTH)
     ) u_mext_router_ahb (
         .aclk(aclk), .aresetn(aresetn),
-        .aw_sel(mext0_aw_sel), .ar_sel(mext0_ar_sel),
+        .aw_sel(mext_rt_aw_sel), .ar_sel(mext_rt_ar_sel),
         .s_awvalid(mext_rt_awvalid), .s_awready(mext_rt_awready),
-        .s_awid(mext_rt_awid), .s_awaddr(mext_rt_awaddr), .s_awlen(mext_rt_awlen),
+        .s_awid(mext_rt_awid), .s_awaddr(mext_rt_awaddr_tgt), .s_awlen(mext_rt_awlen),
         .s_awsize(mext_rt_awsize), .s_awburst(mext_rt_awburst), .s_awlock(mext_rt_awlock),
         .s_awcache(mext_rt_awcache), .s_awprot(mext_rt_awprot),
         .s_wvalid(mext_rt_wvalid), .s_wready(mext_rt_wready),
@@ -1085,7 +1116,7 @@ module lbus_srps #(
         .s_bvalid(mext_rt_bvalid), .s_bready(mext_rt_bready),
         .s_bid(mext_rt_bid), .s_bresp(mext_rt_bresp),
         .s_arvalid(mext_rt_arvalid), .s_arready(mext_rt_arready),
-        .s_arid(mext_rt_arid), .s_araddr(mext_rt_araddr), .s_arlen(mext_rt_arlen),
+        .s_arid(mext_rt_arid), .s_araddr(mext_rt_araddr_tgt), .s_arlen(mext_rt_arlen),
         .s_arsize(mext_rt_arsize), .s_arburst(mext_rt_arburst), .s_arlock(mext_rt_arlock),
         .s_arcache(mext_rt_arcache), .s_arprot(mext_rt_arprot),
         .s_rvalid(mext_rt_rvalid), .s_rready(mext_rt_rready),
@@ -1096,5 +1127,42 @@ module lbus_srps #(
         .hwdata(ssrp_hwdata), .hrdata(ssrp_hrdata),
         .hready(ssrp_hready), .hresp(ssrp_hresp)
     );
+
+    // -------------------------------------------------------------------------
+    // Elaboration checks
+    // -------------------------------------------------------------------------
+    `ifdef SYNTHESIS
+    `else
+    initial begin
+        if (MSRP_MERGE_CFG < 1 || MSRP_MERGE_CFG > 3) begin
+            $error("%m: lbus_srps: MSRP_MERGE_CFG must be 1, 2, or 3 (got %0d)",
+                   MSRP_MERGE_CFG);
+        end
+        if (SEXTMEM_PORT_NUM != ((1 << (MSRP_MERGE_CFG - 1)) + 1)) begin
+            $error("%m: lbus_srps: SEXTMEM_PORT_NUM (%0d) must equal (1<<(MSRP_MERGE_CFG-1))+1 (%0d)",
+                   SEXTMEM_PORT_NUM, (1 << (MSRP_MERGE_CFG - 1)) + 1);
+        end
+        if (SEXTMEM_ID_WIDTH < MSRP_ID_WIDTH + MEM_MERGE_TAG_W) begin
+            $error("%m: lbus_srps: SEXTMEM_ID_WIDTH must be >= MSRP_ID_WIDTH+MEM_MERGE_TAG_W (%0d)",
+                   MSRP_ID_WIDTH + MEM_MERGE_TAG_W);
+        end
+        if (SEXTIO_ID_WIDTH < MSRP_ID_WIDTH + IO_MERGE_TAG_W) begin
+            $error("%m: lbus_srps: SEXTIO_ID_WIDTH must be >= MSRP_ID_WIDTH+IO_MERGE_TAG_W (%0d)",
+                   MSRP_ID_WIDTH + IO_MERGE_TAG_W);
+        end
+        if (MSRP_WR_PENDING_DEPTH < 1) begin
+            $error("%m: lbus_srps: MSRP_WR_PENDING_DEPTH must be >= 1 (got %0d)",
+                   MSRP_WR_PENDING_DEPTH);
+        end
+        if (SEXTMEM_BYPASS_PAD_W < 0) begin
+            $error("%m: lbus_srps: SEXTMEM_ID_WIDTH must be >= MSRP_ID_WIDTH for bypass pad (got %0d)",
+                   SEXTMEM_ID_WIDTH);
+        end
+        if (IO_MERGE_TAG_W < $clog2(NUM_SRP)) begin
+            $error("%m: lbus_srps: IO_MERGE_TAG_W must be >= $clog2(NUM_SRP) for io 9:1 merge (got %0d, need %0d)",
+                   IO_MERGE_TAG_W, $clog2(NUM_SRP));
+        end
+    end
+    `endif
 
 endmodule

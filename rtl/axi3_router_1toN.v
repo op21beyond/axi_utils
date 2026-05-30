@@ -164,8 +164,8 @@ module axi3_router_1toN #(
     wire [SEL_W-1:0] r_cur_sel = r_sel_fifo[r_rd_ptr];
 
     // aw_sel/ar_sel: one-hot when s_awvalid/s_arvalid (assumed by environment)
-    assign s_awready = s_awvalid && !w_fifo_full && m_awready[aw_sel_idx];
-    assign s_arready = s_arvalid && !r_fifo_full && m_arready[ar_sel_idx];
+    assign s_awready = !w_fifo_full && m_awready[aw_sel_idx];
+    assign s_arready = !r_fifo_full && m_arready[ar_sel_idx];
 
     assign s_wready  = !w_fifo_empty && m_wready[w_cur_sel] &&
                        (!s_wlast || !b_fifo_full);
@@ -279,5 +279,36 @@ module axi3_router_1toN #(
             endcase
         end
     end
+
+    // synopsys translate_off
+    // Simulation-only: aw_sel/ar_sel must be one-hot when valid is asserted.
+    always @(posedge aclk or negedge aresetn) begin
+        integer sel_k;
+        integer aw_sel_cnt;
+        integer ar_sel_cnt;
+
+        if (aresetn) begin
+            if (s_awvalid) begin
+                aw_sel_cnt = 0;
+                for (sel_k = 0; sel_k < N; sel_k = sel_k + 1) begin
+                    if (aw_sel[sel_k])
+                        aw_sel_cnt = aw_sel_cnt + 1;
+                end
+                if (aw_sel_cnt != 1)
+                    $error("%m: axi3_router_1toN: aw_sel must be one-hot when s_awvalid");
+            end
+
+            if (s_arvalid) begin
+                ar_sel_cnt = 0;
+                for (sel_k = 0; sel_k < N; sel_k = sel_k + 1) begin
+                    if (ar_sel[sel_k])
+                        ar_sel_cnt = ar_sel_cnt + 1;
+                end
+                if (ar_sel_cnt != 1)
+                    $error("%m: axi3_router_1toN: ar_sel must be one-hot when s_arvalid");
+            end
+        end
+    end
+    // synopsys translate_on
 
 endmodule

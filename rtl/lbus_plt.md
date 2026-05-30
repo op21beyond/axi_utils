@@ -1,91 +1,91 @@
 # lbus_plt Module Guide
 
 ## General Description
-`lbus_plt` is a platform local-bus top that provides two independent AXI3-to-AHB fanout paths.
+`lbus_plt` is a platform local-bus top with a single AXI3 slave path to multiple AHB-Lite ports.
 
-- Path 0: `mext0` (AXI3 slave, 32-bit) -> register slice -> `NUM_SREG` AHB-Lite ports (`sreg*`)
-- Path 1: `mext1` (AXI3 slave, 32-bit) -> register slice -> `NUM_SMEM` AHB-Lite ports (`smem*`)
-- `NUM_SREG` and `NUM_SMEM` are independent and can be different.
-- Target selection for each AXI transaction is externally provided by one-hot `aw_sel/ar_sel`.
+- `mext` (AXI3 slave, 32-bit) -> per-channel `axi3_reg_slice_ch` -> `axi3_router_1toN_ahblite` -> `NUM_PORTS` AHB-Lite outputs (`ahb_*`)
+- AHB target select (`aw_sel` / `ar_sel`) is decoded internally from `mext` AW/AR address via `axi3_ahb_region_sel`.
 
 ## Mermaid Block Diagram
 ```mermaid
 flowchart LR
-    A0["mext0 AXI3 slave"] --> RS0["lbus_axi32_reg_slice_wrap"]
-    RS0 --> R0["axi3_router_1toN_ahblite (N=NUM_SREG)"]
-    R0 --> SREG["sreg_h* packed AHB-Lite bus"]
-
-    A1["mext1 AXI3 slave"] --> RS1["lbus_axi32_reg_slice_wrap"]
-    RS1 --> R1["axi3_router_1toN_ahblite (N=NUM_SMEM)"]
-    R1 --> SMEM["smem_h* packed AHB-Lite bus"]
+    MEXT["mext AXI3 slave"] --> AW["u_aw_slice"]
+    MEXT --> W["u_w_slice"]
+    MEXT --> AR["u_ar_slice"]
+  B["u_b_slice"] --> MEXT
+  R["u_r_slice"] --> MEXT
+    AW --> DEC["axi3_ahb_region_sel"]
+    AR --> DEC
+    AW --> RT["axi3_router_1toN_ahblite"]
+    W --> RT
+    AR --> RT
+    DEC --> RT
+    RT --> B
+    RT --> R
+    RT --> AHB["ahb_h* packed AHB-Lite"]
 ```
 
+## Address Map and Target Decode
+Each AHB port owns an equal-sized region. `AHB_REGION_SIZE_KB` sets the slot size in kilobytes (power of two; e.g. `4` = 4KB, `1024` = 1MB).
+
+- Lower `REGION_LSB = $clog2(AHB_REGION_SIZE_KB * 1024)` address bits are passed to the selected AHB target.
+- The next `DECODE_W = $clog2(NUM_PORTS)` bits (when `NUM_PORTS > 1`) select the one-hot router target.
+- Bits above the decode field are unused; `axi3_ahb_region_sel` zeros them at the input (`addr_map`) before register slices.
+- After the slice, `addr_tgt` clears the decode field as well so only `[REGION_LSB-1:0]` reaches the router/AHB bridge.
+- The mext base address is assumed aligned to `(region size) × 2^X` where `2^X ≥ NUM_PORTS`.
+- Decode codes `≥ NUM_PORTS` map to the **last** port (covers non-power-of-two fanout).
+
+Example: `NUM_PORTS=3`, `AHB_REGION_SIZE_KB=4` (4KB, `REGION_LSB=12`):
+
+| `awaddr[13:12]` | `aw_sel` |
+|-----------------|----------|
+| `2'b00`         | `3'b001` (port 0) |
+| `2'b01`         | `3'b010` (port 1) |
+| `2'b10`, `2'b11`| `3'b100` (port 2) |
+
+Decode uses post-slice addresses for `sel`; router `s_*addr` uses `addr_tgt` (target offset only).
+
 ## Design Assumptions
-- `mext0_aw_sel/mext0_ar_sel` are valid one-hot vectors with width `NUM_SREG`.
-- `mext1_aw_sel/mext1_ar_sel` are valid one-hot vectors with width `NUM_SMEM`.
-- AXI and AHB clocks/resets are common through `aclk` / `aresetn`.
-- AHB endpoints correctly return `hready/hresp/hrdata` for each selected slot.
-- Protocol legality checks are mostly expected to be guaranteed by the upstream master/system policy.
+- `mext` address map follows the equal-slot layout above; integration must align the mext base accordingly.
+- Decoded `aw_sel` / `ar_sel` are one-hot when `mext_awvalid` / `mext_arvalid` (checked in `axi3_router_1toN`).
+- Common `aclk` / `aresetn` for AXI and AHB.
+- AHB endpoints return `hready` / `hresp` / `hrdata` per slot.
+- AHB outputs SINGLE transfers only (`hburst=000`, `htrans=IDLE`/`NONSEQ`).
+
+## Simulation checks and elaboration
+
+| Check | Location | Notes |
+|-------|----------|-------|
+| mext decoded `aw_sel`/`ar_sel` one-hot | `axi3_router_1toN` | sim-only |
+| AHB region decode / `AHB_REGION_SIZE_KB` | `axi3_ahb_region_sel`, `lbus_plt` | elaboration `initial` |
+| `NUM_PORTS`, decode field vs `ADDR_WIDTH` | `lbus_plt` | elaboration `initial` |
 
 ## Submodule Summary
-- `lbus_axi32_reg_slice_wrap` (2 instances)
-  - Adds optional per-channel skid/register slicing at `mext0` and `mext1` boundaries.
-  - Controlled by `MEXT0_SLICE_EN`, `MEXT1_SLICE_EN`.
-- `axi3_router_1toN_ahblite` (2 instances)
-  - Routes one AXI slave input to N AHB-Lite outputs.
-  - Converts AXI3 transactions to AHB-Lite via internal bridge logic.
-  - One instance is configured with `N=NUM_SREG`, the other with `N=NUM_SMEM`.
+- `axi3_reg_slice_ch` (5 instances: AW, W, B, AR, R)
+  - Optional per-channel register slice at the mext boundary.
+  - Controlled by `AW_SLICE_EN`, `W_SLICE_EN`, `B_SLICE_EN`, `AR_SLICE_EN`, `R_SLICE_EN`.
+- `axi3_ahb_region_sel` (4 instances: AW/AR input `addr_map`, AW/AR router `sel`+`addr_tgt`)
+- `axi3_router_1toN_ahblite` (1 instance, `N=NUM_PORTS`)
 
 ## Parameter Description
-- `NUM_SREG`  
-  Number of register-side AHB ports (`sreg` fanout count).
-- `NUM_SMEM`  
-  Number of memory-side AHB ports (`smem` fanout count).
-- `MEXT_ID_WIDTH`  
-  AXI ID width for both `mext0` and `mext1`.
-- `ADDR_WIDTH`  
-  Common AXI/AHB address width.
-- `DATA_WIDTH`  
-  AXI/AHB data width for both paths (current module uses 32-bit default).
-- `HADDR_LOW_BITS`  
-  Number of valid low bits kept in AHB address output masking policy.
-- `ROUTER_OUTSTANDING`  
-  Outstanding ordering/FIFO depth in router path.
-- `WR_CMD_DEPTH`, `RD_CMD_DEPTH`, `RESP_DEPTH`  
-  Internal AXI-to-AHB bridge queue depths.
-- `BUSY_ENABLE`  
-  Enables handling/forwarding of AHB BUSY behavior in bridge.
-- `MEXT0_SLICE_EN`, `MEXT1_SLICE_EN`  
-  Global on/off for all AXI channels in each path's register slice.
+- `NUM_PORTS` — AHB-Lite fanout count (default 16).
+- `MEXT_ID_WIDTH` — AXI ID width.
+- `ADDR_WIDTH`, `DATA_WIDTH` — 32-bit default.
+- `AHB_REGION_SIZE_KB` — Equal AHB slot size in kilobytes (default 4 = 4KB; must be power of two).
+- `ROUTER_OUTSTANDING`, `WR_CMD_DEPTH`, `RD_CMD_DEPTH`, `RESP_DEPTH` — Router/bridge depths.
+- `AW_SLICE_EN`, `W_SLICE_EN`, `B_SLICE_EN`, `AR_SLICE_EN`, `R_SLICE_EN` — Per-channel slice enable (0 = comb bypass).
 
 ## Connection Method
-### 1) Basic hookup
-- Connect `mext0_*` AXI slave ports and provide `mext0_aw_sel/ar_sel` one-hot target.
-- Connect `mext1_*` AXI slave ports and provide `mext1_aw_sel/ar_sel` one-hot target.
-- Connect packed AHB buses:
-  - `sreg_h*` for register-side targets
-  - `smem_h*` for memory-side targets
+### Packed AHB indexing
+- Slot `i`: `ahb_haddr[i*ADDR_WIDTH +: ADDR_WIDTH]`, etc.
 
-### 2) Packed AHB indexing
-- Slot `i` uses bit slices:
-  - `haddr[i*ADDR_WIDTH +: ADDR_WIDTH]`
-  - `htrans[i*2 +: 2]`
-  - `hsize[i*3 +: 3]`
-  - `hburst[i*3 +: 3]`
-  - `hprot[i*4 +: 4]`
-  - `hwdata[i*DATA_WIDTH +: DATA_WIDTH]`
-
-### 3) Unused-port handling
-- Preferred method: reduce `NUM_SREG` / `NUM_SMEM` to the actual used count.
-- If fixed top-level width must be kept and some AHB slots are unused:
-  - drive `hready=1'b1`, `hresp=1'b0` on unused slave return channels
-  - tie `hrdata` to zero on unused slots
-  - keep corresponding `aw_sel/ar_sel` bits at `0` so no transaction selects those slots
-- If one full AXI path (`mext0` or `mext1`) is intentionally unused:
-  - hold its AXI valids low (`awvalid/wvalid/arvalid=0`)
-  - tie its selection vectors to zero
-  - leave the opposite path fully operational
+### Migration from v1.0.0 (dual mext0/mext1)
+- Replace `mext0_*` / `mext1_*` with single `mext_*`.
+- Merge `NUM_SREG` + `NUM_SMEM` into one `NUM_PORTS` router.
+- Remove external `mext_aw_sel` / `mext_ar_sel` ports; target select is address-decoded.
+- Replace `sreg_h*` / `smem_h*` with `ahb_h*`.
+- Replace `MEXT0_SLICE_EN` / `MEXT1_SLICE_EN` with per-channel `AW_SLICE_EN` … `R_SLICE_EN`.
 
 ## Notes
-- This module is a **1-to-N distribution** topology for each path, not an N-to-1 merge topology.
-- Register slices are inserted before routing/bridge logic to improve timing closure at boundary interfaces.
+- 1-to-N distribution topology; not N-to-1 merge.
+- Per-channel `axi3_reg_slice_ch` instances replace the former `lbus_axi32_reg_slice_wrap` module.

@@ -1,27 +1,30 @@
 // -----------------------------------------------------------------------------
 // Module      : axi3_merge_Nto1_128
-// Date        : 2026-05-28
-// Version     : v1.0.0
+// Date        : 2026-05-29
+// Version     : v1.1.0
 // Author      : Jongchul Shin
 // Function    : Merge N AXI3 (128-bit) inputs into a single AXI3 output.
-//               AW/W/AR channels are arbitrated with round-robin policy.
+//               AW/AR use round-robin; W follows AW acceptance order via FIFO.
 //               Output ID is widened with source index bits.
 // Assumptions : USER/QOS signals are not present.
 //               LOCK/CACHE/PROT are routed without special behavior.
+//               Each input port does not interleave W beats (AW-before-W per port).
 // Notes       : B/R channels are de-multiplexed using widened BID/RID source bits.
 //               Payload fields are don't-care when valid is low (no default mux).
+//               AW is backpressured when the W ordering FIFO is full.
 // -----------------------------------------------------------------------------
 module axi3_merge_Nto1_128 #(
-    parameter integer N            = 2,                 // Number of AXI input ports
-    parameter integer ADDR_WIDTH   = 32,                // AXI address width
-    parameter integer DATA_WIDTH   = 128,               // AXI data width (target: 128-bit)
-    parameter integer STRB_WIDTH   = DATA_WIDTH / 8,    // AXI strobe width
-    parameter integer IN_ID_WIDTH  = 4,                 // Input AXI ID width per source
-    parameter integer SRC_ID_WIDTH = (N <= 2)  ? 1 :
-                                     (N <= 4)  ? 2 :
-                                     (N <= 8)  ? 3 :
-                                     (N <= 16) ? 4 :
-                                     (N <= 32) ? 5 : 6  // Source-index width added to output ID
+    parameter integer N                    = 2,                 // Number of AXI input ports
+    parameter integer ADDR_WIDTH             = 32,                // AXI address width
+    parameter integer DATA_WIDTH             = 128,               // AXI data width (target: 128-bit)
+    parameter integer STRB_WIDTH             = DATA_WIDTH / 8,    // AXI strobe width
+    parameter integer IN_ID_WIDTH            = 4,                 // Input AXI ID width per source
+    parameter integer WR_OUTSTANDING_DEPTH   = 16,                // W ordering FIFO depth
+    parameter integer SRC_ID_WIDTH           = (N <= 2)  ? 1 :
+                                               (N <= 4)  ? 2 :
+                                               (N <= 8)  ? 3 :
+                                               (N <= 16) ? 4 :
+                                               (N <= 32) ? 5 : 6  // Source-index width
 ) (
     input  wire                             aclk,
     input  wire                             aresetn,
@@ -112,7 +115,21 @@ module axi3_merge_Nto1_128 #(
     localparam integer SRC_W = SRC_ID_WIDTH;
     localparam integer OUT_ID_WIDTH = IN_ID_WIDTH + SRC_W;
 
-    reg [SRC_W-1:0] rr_aw_q, rr_w_q, rr_ar_q;
+    localparam integer W_PTR_W = (WR_OUTSTANDING_DEPTH <= 2) ? 1 :
+                                 (WR_OUTSTANDING_DEPTH <= 4) ? 2 :
+                                 (WR_OUTSTANDING_DEPTH <= 8) ? 3 :
+                                 (WR_OUTSTANDING_DEPTH <= 16) ? 4 :
+                                 (WR_OUTSTANDING_DEPTH <= 32) ? 5 :
+                                 (WR_OUTSTANDING_DEPTH <= 64) ? 6 : 7;
+
+    reg [SRC_W-1:0] rr_aw_q, rr_ar_q;
+
+    reg [SRC_W-1:0] w_sel_fifo [0:WR_OUTSTANDING_DEPTH-1];
+    reg [W_PTR_W-1:0] w_wr_ptr, w_rd_ptr;
+    reg [W_PTR_W:0]   w_count;
+
+    wire w_fifo_empty = (w_count == 0);
+    wire w_fifo_full  = (w_count == WR_OUTSTANDING_DEPTH);
 
     wire             aw_grant_v;
     wire [SRC_W-1:0] aw_grant_i;
@@ -120,6 +137,12 @@ module axi3_merge_Nto1_128 #(
     wire [SRC_W-1:0] w_grant_i;
     wire             ar_grant_v;
     wire [SRC_W-1:0] ar_grant_i;
+
+    wire aw_hs     = aw_grant_v && m_awready && !w_fifo_full;
+    wire w_hs      = w_grant_v && m_wready;
+    wire w_last_hs = w_hs && m_wlast;
+
+    wire [SRC_W-1:0] w_cur_sel = w_sel_fifo[w_rd_ptr];
 
     wire [SRC_W-1:0] b_src_i = m_bid[OUT_ID_WIDTH-1 -: SRC_W];
     wire [SRC_W-1:0] r_src_i = m_rid[OUT_ID_WIDTH-1 -: SRC_W];
@@ -146,20 +169,8 @@ module axi3_merge_Nto1_128 #(
         end
     end
 
-    always @(*) begin
-        w_grant_v = 1'b0;
-        w_grant_i = {SRC_W{1'b0}};
-        for (k = 0; k < N; k = k + 1) begin
-            idx = rr_w_q + k;
-            if (idx >= N) begin
-                idx = idx - N;
-            end
-            if (!w_grant_v && s_wvalid[idx]) begin
-                w_grant_v = 1'b1;
-                w_grant_i = idx[SRC_W-1:0];
-            end
-        end
-    end
+    assign w_grant_i = w_cur_sel;
+    assign w_grant_v = !w_fifo_empty && s_wvalid[w_cur_sel];
 
     always @(*) begin
         ar_grant_v = 1'b0;
@@ -176,8 +187,8 @@ module axi3_merge_Nto1_128 #(
         end
     end
 
-    assign m_awvalid = aw_grant_v;
-    assign s_awready = aw_grant_v ?
+    assign m_awvalid = aw_grant_v && !w_fifo_full;
+    assign s_awready = (aw_grant_v && !w_fifo_full) ?
                        ({{(N-1){1'b0}}, 1'b1} << aw_grant_i) & {N{m_awready}} :
                        {N{1'b0}};
 
@@ -229,21 +240,33 @@ module axi3_merge_Nto1_128 #(
     always @(posedge aclk or negedge aresetn) begin
         if (!aresetn) begin
             rr_aw_q <= {SRC_W{1'b0}};
-            rr_w_q  <= {SRC_W{1'b0}};
             rr_ar_q <= {SRC_W{1'b0}};
+            w_wr_ptr <= {W_PTR_W{1'b0}};
+            w_rd_ptr <= {W_PTR_W{1'b0}};
+            w_count  <= {(W_PTR_W+1){1'b0}};
         end else begin
-            if (aw_grant_v && m_awready) begin
+            if (aw_hs) begin
+                w_sel_fifo[w_wr_ptr] <= aw_grant_i;
+                w_wr_ptr <= (w_wr_ptr == WR_OUTSTANDING_DEPTH-1) ? {W_PTR_W{1'b0}} :
+                            (w_wr_ptr + 1'b1);
+            end
+
+            if (w_last_hs && !w_fifo_empty) begin
+                w_rd_ptr <= (w_rd_ptr == WR_OUTSTANDING_DEPTH-1) ? {W_PTR_W{1'b0}} :
+                            (w_rd_ptr + 1'b1);
+            end
+
+            case ({aw_hs, (w_last_hs && !w_fifo_empty)})
+                2'b10: w_count <= w_count + 1'b1;
+                2'b01: w_count <= w_count - 1'b1;
+                default: w_count <= w_count;
+            endcase
+
+            if (aw_hs) begin
                 if (aw_grant_i == N-1) begin
                     rr_aw_q <= {SRC_W{1'b0}};
                 end else begin
                     rr_aw_q <= aw_grant_i + {{(SRC_W-1){1'b0}}, 1'b1};
-                end
-            end
-            if (w_grant_v && m_wready) begin
-                if (w_grant_i == N-1) begin
-                    rr_w_q <= {SRC_W{1'b0}};
-                end else begin
-                    rr_w_q <= w_grant_i + {{(SRC_W-1){1'b0}}, 1'b1};
                 end
             end
             if (ar_grant_v && m_arready) begin
@@ -255,5 +278,16 @@ module axi3_merge_Nto1_128 #(
             end
         end
     end
+
+    // synopsys translate_off
+    always @(posedge aclk or negedge aresetn) begin
+        if (aresetn) begin
+            if (aw_grant_v && m_awready && w_fifo_full)
+                $error("%m: axi3_merge_Nto1_128: AW handshake while W ordering FIFO full");
+            if (w_hs && w_fifo_empty)
+                $error("%m: axi3_merge_Nto1_128: W beat without accepted AW in ordering FIFO");
+        end
+    end
+    // synopsys translate_on
 
 endmodule

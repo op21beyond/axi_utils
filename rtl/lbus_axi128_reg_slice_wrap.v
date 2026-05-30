@@ -98,6 +98,7 @@ module lbus_axi128_reg_slice_wrap #(
 );
 
     localparam integer AW_P = ID_WIDTH + ADDR_WIDTH + 4 + 3 + 2 + 2 + 4 + 3;
+    localparam integer AR_P = ID_WIDTH + ADDR_WIDTH + 4 + 3 + 2 + 2 + 4 + 3;
     localparam integer W_P  = ID_WIDTH + DATA_WIDTH + STRB_WIDTH + 1;
     localparam integer B_P  = ID_WIDTH + 2;
     localparam integer R_P  = ID_WIDTH + DATA_WIDTH + 2 + 1;
@@ -108,8 +109,8 @@ module lbus_axi128_reg_slice_wrap #(
     wire [W_P-1:0]  w_pld_m;
     wire [B_P-1:0]  b_pld_s;
     wire [B_P-1:0]  b_pld_m;
-    wire [AW_P-1:0] ar_pld_s;
-    wire [AW_P-1:0] ar_pld_m;
+    wire [AR_P-1:0] ar_pld_s;
+    wire [AR_P-1:0] ar_pld_m;
     wire [R_P-1:0]  r_pld_s;
     wire [R_P-1:0]  r_pld_m;
 
@@ -125,7 +126,7 @@ module lbus_axi128_reg_slice_wrap #(
         .AW_PAYLOAD_WIDTH(AW_P),
         .W_PAYLOAD_WIDTH(W_P),
         .B_PAYLOAD_WIDTH(B_P),
-        .AR_PAYLOAD_WIDTH(AW_P),
+        .AR_PAYLOAD_WIDTH(AR_P),
         .R_PAYLOAD_WIDTH(R_P),
         .AW_SLICE_EN(AW_SLICE_EN),
         .W_SLICE_EN(W_SLICE_EN),

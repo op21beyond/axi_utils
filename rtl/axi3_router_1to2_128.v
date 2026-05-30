@@ -11,6 +11,7 @@
 //               LOCK/CACHE/EXCLUSIVE/PROT are forwarded without special handling.
 // Notes       : Write and read ordering domains are independent.
 //               B and R response arbitration uses round-robin across targets.
+//               Simulation-only one-hot check on aw_sel/ar_sel when valid.
 // -----------------------------------------------------------------------------
 module axi3_router_1to2_128 #(
     parameter integer ADDR_WIDTH = 32,                 // AXI address width
@@ -206,26 +207,36 @@ module axi3_router_1to2_128 #(
                 rd_outs[i] <= {CNT_WIDTH{1'b0}};
             end
         end else begin
-            if (aw_hs) begin
-                if (!wr_has_outstanding) begin
+            // Write outstanding — same-ID simultaneous AW+B: +1/-1 cancel
+            if (aw_hs && b_hs && (s_awid == b_id_sel)) begin
+                if (!wr_has_outstanding)
                     wr_tgt[s_awid] <= aw_tgt;
+            end else begin
+                if (aw_hs) begin
+                    if (!wr_has_outstanding)
+                        wr_tgt[s_awid] <= aw_tgt;
+                    wr_outs[s_awid] <= wr_outs[s_awid] + {{(CNT_WIDTH-1){1'b0}}, 1'b1};
                 end
-                wr_outs[s_awid] <= wr_outs[s_awid] + {{(CNT_WIDTH-1){1'b0}}, 1'b1};
+
+                if (b_hs) begin
+                    wr_outs[b_id_sel] <= wr_outs[b_id_sel] - {{(CNT_WIDTH-1){1'b0}}, 1'b1};
+                end
             end
 
-            if (b_hs) begin
-                wr_outs[b_id_sel] <= wr_outs[b_id_sel] - {{(CNT_WIDTH-1){1'b0}}, 1'b1};
-            end
-
-            if (ar_hs) begin
-                if (!rd_has_outstanding) begin
+            // Read outstanding — same-ID simultaneous AR+last-R: +1/-1 cancel
+            if (ar_hs && r_hs && r_last_sel && (s_arid == r_id_sel)) begin
+                if (!rd_has_outstanding)
                     rd_tgt[s_arid] <= ar_tgt;
+            end else begin
+                if (ar_hs) begin
+                    if (!rd_has_outstanding)
+                        rd_tgt[s_arid] <= ar_tgt;
+                    rd_outs[s_arid] <= rd_outs[s_arid] + {{(CNT_WIDTH-1){1'b0}}, 1'b1};
                 end
-                rd_outs[s_arid] <= rd_outs[s_arid] + {{(CNT_WIDTH-1){1'b0}}, 1'b1};
-            end
 
-            if (r_hs && r_last_sel) begin
-                rd_outs[r_id_sel] <= rd_outs[r_id_sel] - {{(CNT_WIDTH-1){1'b0}}, 1'b1};
+                if (r_hs && r_last_sel) begin
+                    rd_outs[r_id_sel] <= rd_outs[r_id_sel] - {{(CNT_WIDTH-1){1'b0}}, 1'b1};
+                end
             end
 
             if (b_hs && m_bvalid[0] && m_bvalid[1]) begin
@@ -237,5 +248,27 @@ module axi3_router_1to2_128 #(
             end
         end
     end
+
+    // synopsys translate_off
+    // Simulation-only: aw_sel/ar_sel must be one-hot when valid is asserted.
+    always @(posedge aclk or negedge aresetn) begin
+        integer aw_sel_cnt;
+        integer ar_sel_cnt;
+
+        if (aresetn) begin
+            if (s_awvalid) begin
+                aw_sel_cnt = aw_sel[0] + aw_sel[1];
+                if (aw_sel_cnt != 1)
+                    $error("%m: axi3_router_1to2_128: aw_sel must be one-hot when s_awvalid");
+            end
+
+            if (s_arvalid) begin
+                ar_sel_cnt = ar_sel[0] + ar_sel[1];
+                if (ar_sel_cnt != 1)
+                    $error("%m: axi3_router_1to2_128: ar_sel must be one-hot when s_arvalid");
+            end
+        end
+    end
+    // synopsys translate_on
 
 endmodule

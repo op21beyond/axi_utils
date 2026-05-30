@@ -7,21 +7,25 @@
 //               1x AXI3 slave -> AXI3 1:N router -> Nx AXI3-to-AHB-Lite bridges.
 //               Exposes N independent AHB-Lite master ports.
 // Assumptions : Inherits assumptions from axi3_router_1toN and axi3_to_ahblite.
-//               Final AHB HADDR output is masked by HADDR_LOW_BITS.
-// Notes       : HADDR mask affects top-level output only, not internal operation.
+//               Fixed 32-bit AXI/AHB data path (matches axi3_to_ahblite).
+//               aw_sel/ar_sel are one-hot when s_awvalid/s_arvalid is high.
+//               No AXI3 write data interleaving: W beats follow AW acceptance
+//               order; each write completes with WLAST before W for the next AW.
+//               WID equals AWID for every W beat of a write transaction.
+//               Read data returns in AR acceptance order (no R interleaving by RID).
+//               Each downstream bridge obeys axi3_to_ahblite assumptions.
+// Notes       : AHB outputs SINGLE transfers only (hburst=000; htrans=IDLE/NONSEQ).
+//               WID is not used for W routing (target select only); it is stored
+//               on WLAST for BID restore.
 // -----------------------------------------------------------------------------
 module axi3_router_1toN_ahblite #(
     parameter integer N                  = 8,                 // Number of AHB-Lite output ports
     parameter integer ADDR_WIDTH         = 32,                // Address bus width
-    parameter integer HADDR_LOW_BITS     = 32,                // Number of low HADDR bits kept at top output
-    parameter integer DATA_WIDTH         = 32,                // Data bus width
-    parameter integer STRB_WIDTH         = DATA_WIDTH / 8,    // Write strobe width
     parameter integer ID_WIDTH           = 4,                 // Upstream AXI slave ID width
     parameter integer ROUTER_OUTSTANDING = 16,                // Router ordering FIFO depth
     parameter integer WR_CMD_DEPTH       = 16,                // Per-bridge write command depth
     parameter integer RD_CMD_DEPTH       = 16,                // Per-bridge read command depth
-    parameter integer RESP_DEPTH         = 8,                 // Per-bridge response FIFO depth
-    parameter         BUSY_ENABLE        = 1'b1               // Per-bridge BUSY transfer enable
+    parameter integer RESP_DEPTH         = 8                  // Per-bridge response FIFO depth
 ) (
     input  wire                         aclk,
     input  wire                         aresetn,
@@ -43,8 +47,8 @@ module axi3_router_1toN_ahblite #(
     input  wire                         s_wvalid,
     output wire                         s_wready,
     input  wire [ID_WIDTH-1:0]          s_wid,
-    input  wire [DATA_WIDTH-1:0]        s_wdata,
-    input  wire [STRB_WIDTH-1:0]        s_wstrb,
+    input  wire [31:0]                  s_wdata,
+    input  wire [3:0]                   s_wstrb,
     input  wire                         s_wlast,
 
     output wire                         s_bvalid,
@@ -66,7 +70,7 @@ module axi3_router_1toN_ahblite #(
     output wire                         s_rvalid,
     input  wire                         s_rready,
     output wire [ID_WIDTH-1:0]          s_rid,
-    output wire [DATA_WIDTH-1:0]        s_rdata,
+    output wire [31:0]                  s_rdata,
     output wire [1:0]                   s_rresp,
     output wire                         s_rlast,
 
@@ -75,8 +79,8 @@ module axi3_router_1toN_ahblite #(
     output wire [N-1:0]                 hwrite,
     output wire [N*3-1:0]               hsize,
     output wire [N*3-1:0]               hburst,
-    output wire [N*DATA_WIDTH-1:0]      hwdata,
-    input  wire [N*DATA_WIDTH-1:0]      hrdata,
+    output wire [N*32-1:0]              hwdata,
+    input  wire [N*32-1:0]              hrdata,
     input  wire [N-1:0]                 hready,
     input  wire [N-1:0]                 hresp
 );
@@ -93,8 +97,8 @@ module axi3_router_1toN_ahblite #(
 
     wire [N-1:0]            m_wvalid;
     wire [N-1:0]            m_wready;
-    wire [N*DATA_WIDTH-1:0] m_wdata;
-    wire [N*STRB_WIDTH-1:0] m_wstrb;
+    wire [N*32-1:0] m_wdata;
+    wire [N*4-1:0]  m_wstrb;
     wire [N-1:0]            m_wlast;
 
     wire [N-1:0]            m_bvalid;
@@ -113,24 +117,15 @@ module axi3_router_1toN_ahblite #(
 
     wire [N-1:0]            m_rvalid;
     wire [N-1:0]            m_rready;
-    wire [N*DATA_WIDTH-1:0] m_rdata;
+    wire [N*32-1:0] m_rdata;
     wire [N*2-1:0]          m_rresp;
     wire [N-1:0]            m_rlast;
-    wire [N*ADDR_WIDTH-1:0] haddr_int;
-
-    function [ADDR_WIDTH-1:0] mask_haddr;
-        input [ADDR_WIDTH-1:0] addr_in;
-        begin
-            mask_haddr = {ADDR_WIDTH{1'b0}};
-            mask_haddr[HADDR_LOW_BITS-1:0] = addr_in[HADDR_LOW_BITS-1:0];
-        end
-    endfunction
 
     axi3_router_1toN #(
         .N(N),
         .ADDR_WIDTH(ADDR_WIDTH),
-        .DATA_WIDTH(DATA_WIDTH),
-        .STRB_WIDTH(STRB_WIDTH),
+        .DATA_WIDTH(32),
+        .STRB_WIDTH(4),
         .ID_WIDTH(ID_WIDTH),
         .OUTSTANDING_DEPTH(ROUTER_OUTSTANDING)
     ) u_axi3_router_1toN (
@@ -214,8 +209,7 @@ module axi3_router_1toN_ahblite #(
                 .ADDR_WIDTH(ADDR_WIDTH),
                 .WR_CMD_DEPTH(WR_CMD_DEPTH),
                 .RD_CMD_DEPTH(RD_CMD_DEPTH),
-                .RESP_DEPTH(RESP_DEPTH),
-                .BUSY_ENABLE(BUSY_ENABLE)
+                .RESP_DEPTH(RESP_DEPTH)
             ) u_axi3_to_ahblite (
                 .aclk(aclk),
                 .aresetn(aresetn),
@@ -230,8 +224,8 @@ module axi3_router_1toN_ahblite #(
                 .s_awprot(m_awprot[(i*3) +: 3]),
                 .s_wvalid(m_wvalid[i]),
                 .s_wready(m_wready[i]),
-                .s_wdata(m_wdata[(i*DATA_WIDTH) +: DATA_WIDTH]),
-                .s_wstrb(m_wstrb[(i*STRB_WIDTH) +: STRB_WIDTH]),
+                .s_wdata(m_wdata[(i*32) +: 32]),
+                .s_wstrb(m_wstrb[(i*4) +: 4]),
                 .s_wlast(m_wlast[i]),
                 .s_bvalid(m_bvalid[i]),
                 .s_bready(m_bready[i]),
@@ -247,23 +241,109 @@ module axi3_router_1toN_ahblite #(
                 .s_arprot(m_arprot[(i*3) +: 3]),
                 .s_rvalid(m_rvalid[i]),
                 .s_rready(m_rready[i]),
-                .s_rdata(m_rdata[(i*DATA_WIDTH) +: DATA_WIDTH]),
+                .s_rdata(m_rdata[(i*32) +: 32]),
                 .s_rresp(m_rresp[(i*2) +: 2]),
                 .s_rlast(m_rlast[i]),
-                .haddr(haddr_int[(i*ADDR_WIDTH) +: ADDR_WIDTH]),
+                .haddr(haddr[(i*ADDR_WIDTH) +: ADDR_WIDTH]),
                 .htrans(htrans[(i*2) +: 2]),
                 .hwrite(hwrite[i]),
                 .hsize(hsize[(i*3) +: 3]),
                 .hburst(hburst[(i*3) +: 3]),
-                .hwdata(hwdata[(i*DATA_WIDTH) +: DATA_WIDTH]),
-                .hrdata(hrdata[(i*DATA_WIDTH) +: DATA_WIDTH]),
+                .hwdata(hwdata[(i*32) +: 32]),
+                .hrdata(hrdata[(i*32) +: 32]),
                 .hready(hready[i]),
                 .hresp(hresp[i])
             );
-
-            assign haddr[(i*ADDR_WIDTH) +: ADDR_WIDTH] =
-                mask_haddr(haddr_int[(i*ADDR_WIDTH) +: ADDR_WIDTH]);
         end
     endgenerate
+
+    // synopsys translate_off
+    // Simulation-only: verify upstream master meets router ID/ordering assumptions.
+    localparam integer SIM_PTR_W = (ROUTER_OUTSTANDING <= 2) ? 1 :
+                                   (ROUTER_OUTSTANDING <= 4) ? 2 :
+                                   (ROUTER_OUTSTANDING <= 8) ? 3 :
+                                   (ROUTER_OUTSTANDING <= 16) ? 4 :
+                                   (ROUTER_OUTSTANDING <= 32) ? 5 :
+                                   (ROUTER_OUTSTANDING <= 64) ? 6 : 7;
+
+    reg [ID_WIDTH-1:0] sim_wr_id_fifo [0:ROUTER_OUTSTANDING-1];
+    reg [ID_WIDTH-1:0] sim_rd_id_fifo [0:ROUTER_OUTSTANDING-1];
+    reg [SIM_PTR_W-1:0] sim_wr_wr_ptr, sim_wr_rd_ptr;
+    reg [SIM_PTR_W-1:0] sim_rd_wr_ptr, sim_rd_rd_ptr;
+    reg [SIM_PTR_W:0]   sim_wr_count, sim_rd_count;
+
+    wire sim_wr_empty = (sim_wr_count == 0);
+    wire sim_rd_empty = (sim_rd_count == 0);
+
+    wire aw_hs     = s_awvalid && s_awready;
+    wire ar_hs     = s_arvalid && s_arready;
+    wire w_hs      = s_wvalid && s_wready;
+    wire w_last_hs = w_hs && s_wlast;
+    wire r_hs      = s_rvalid && s_rready;
+    wire r_last_hs = r_hs && s_rlast;
+
+    always @(posedge aclk or negedge aresetn) begin
+        if (!aresetn) begin
+            sim_wr_wr_ptr <= {SIM_PTR_W{1'b0}};
+            sim_wr_rd_ptr <= {SIM_PTR_W{1'b0}};
+            sim_rd_wr_ptr <= {SIM_PTR_W{1'b0}};
+            sim_rd_rd_ptr <= {SIM_PTR_W{1'b0}};
+            sim_wr_count  <= {(SIM_PTR_W+1){1'b0}};
+            sim_rd_count  <= {(SIM_PTR_W+1){1'b0}};
+        end else begin
+            if (w_hs) begin
+                if (sim_wr_empty)
+                    $error("%m: axi3_router_1toN_ahblite: W beat without accepted AW");
+                else if (s_wid !== sim_wr_id_fifo[sim_wr_rd_ptr])
+                    $error("%m: axi3_router_1toN_ahblite: WID must match front AWID (no write interleaving)");
+            end
+
+            if (r_hs) begin
+                if (sim_rd_empty)
+                    $error("%m: axi3_router_1toN_ahblite: R beat without accepted AR");
+                else if (s_rid !== sim_rd_id_fifo[sim_rd_rd_ptr])
+                    $error("%m: axi3_router_1toN_ahblite: RID must match front ARID (no read interleaving)");
+            end
+
+            if (aw_hs) begin
+                if (sim_wr_count == ROUTER_OUTSTANDING)
+                    $error("%m: axi3_router_1toN_ahblite: AW exceeds router outstanding depth");
+                sim_wr_id_fifo[sim_wr_wr_ptr] <= s_awid;
+                sim_wr_wr_ptr <= (sim_wr_wr_ptr == ROUTER_OUTSTANDING-1) ? {SIM_PTR_W{1'b0}} :
+                                 (sim_wr_wr_ptr + 1'b1);
+            end
+
+            if (w_last_hs && !sim_wr_empty) begin
+                sim_wr_rd_ptr <= (sim_wr_rd_ptr == ROUTER_OUTSTANDING-1) ? {SIM_PTR_W{1'b0}} :
+                                 (sim_wr_rd_ptr + 1'b1);
+            end
+
+            if (ar_hs) begin
+                if (sim_rd_count == ROUTER_OUTSTANDING)
+                    $error("%m: axi3_router_1toN_ahblite: AR exceeds router outstanding depth");
+                sim_rd_id_fifo[sim_rd_wr_ptr] <= s_arid;
+                sim_rd_wr_ptr <= (sim_rd_wr_ptr == ROUTER_OUTSTANDING-1) ? {SIM_PTR_W{1'b0}} :
+                                 (sim_rd_wr_ptr + 1'b1);
+            end
+
+            if (r_last_hs && !sim_rd_empty) begin
+                sim_rd_rd_ptr <= (sim_rd_rd_ptr == ROUTER_OUTSTANDING-1) ? {SIM_PTR_W{1'b0}} :
+                                 (sim_rd_rd_ptr + 1'b1);
+            end
+
+            case ({aw_hs, (w_last_hs && !sim_wr_empty)})
+                2'b10: sim_wr_count <= sim_wr_count + 1'b1;
+                2'b01: sim_wr_count <= sim_wr_count - 1'b1;
+                default: sim_wr_count <= sim_wr_count;
+            endcase
+
+            case ({ar_hs, (r_last_hs && !sim_rd_empty)})
+                2'b10: sim_rd_count <= sim_rd_count + 1'b1;
+                2'b01: sim_rd_count <= sim_rd_count - 1'b1;
+                default: sim_rd_count <= sim_rd_count;
+            endcase
+        end
+    end
+    // synopsys translate_on
 
 endmodule

@@ -20,8 +20,7 @@
 
 //               No LOCK/EXCLUSIVE behavior. ERROR response mapped to OKAY.
 
-// Notes       : BUSY transfer can be emitted when enabled and command exists.
-
+// Notes       : AHB outputs SINGLE transfers only (hburst=000; htrans=IDLE/NONSEQ).
 //               AXI cache/lock/prot and hprot are not used (ports tied off).
 
 // -----------------------------------------------------------------------------
@@ -34,9 +33,7 @@ module axi3_to_ahblite #(
 
     parameter integer RD_CMD_DEPTH = 16,              // Read command FIFO depth (beat-level)
 
-    parameter integer RESP_DEPTH = 8,                 // Read response FIFO depth
-
-    parameter         BUSY_ENABLE = 1'b1              // Enable AHB BUSY output when stalled
+    parameter integer RESP_DEPTH = 8                  // Read response FIFO depth
 
 ) (
 
@@ -172,8 +169,6 @@ module axi3_to_ahblite #(
 
     localparam [1:0] AHB_IDLE   = 2'b00;
 
-    localparam [1:0] AHB_BUSY   = 2'b01;
-
     localparam [1:0] AHB_NONSEQ = 2'b10;
 
 
@@ -215,6 +210,8 @@ module axi3_to_ahblite #(
     reg                    pend_write;
 
     reg                    pend_rlast;
+
+    reg [31:0]             wr_data_pend;
 
 
 
@@ -304,7 +301,8 @@ module axi3_to_ahblite #(
 
 
 
-    assign s_awready = !wr_active && !b_pending;
+    assign s_awready = !wr_active && !b_pending &&
+                       (wr_done_beats_q == wr_total_beats_q);
 
     assign s_wready  = wr_active && !wr_full;
 
@@ -409,6 +407,8 @@ module axi3_to_ahblite #(
             hburst <= 3'b000;
 
             hwdata <= 32'b0;
+
+            wr_data_pend <= 32'b0;
 
         end else begin
 
@@ -540,6 +540,8 @@ module axi3_to_ahblite #(
 
             if (complete_write) begin
 
+                hwdata <= wr_data_pend;
+
                 wr_done_beats_q <= wr_done_beats_q + 5'd1;
 
                 if ((wr_done_beats_q + 5'd1) == wr_total_beats_q) begin
@@ -614,7 +616,7 @@ module axi3_to_ahblite #(
 
                     htrans <= AHB_NONSEQ;
 
-                    hwdata <= wr_data_fifo[wr_rd_ptr];
+                    wr_data_pend <= wr_data_fifo[wr_rd_ptr];
 
                 end else if (issue_rd) begin
 
@@ -636,15 +638,7 @@ module axi3_to_ahblite #(
 
                     hburst <= 3'b000;
 
-                    if (BUSY_ENABLE && (wr_issue_valid || rd_issue_valid)) begin
-
-                        htrans <= AHB_BUSY;
-
-                    end else begin
-
-                        htrans <= AHB_IDLE;
-
-                    end
+                    htrans <= AHB_IDLE;
 
                 end
 
@@ -666,7 +660,8 @@ module axi3_to_ahblite #(
 
                     pend_write <= 1'b0;
 
-                    pend_rlast <= ((rd_done_beats_q + 5'd1) == rd_total_beats_q);
+                    pend_rlast <= ((rd_done_beats_q + (complete_read ? 5'd2 : 5'd1))
+                                   == rd_total_beats_q);
 
                 end
 
@@ -688,15 +683,74 @@ module axi3_to_ahblite #(
 
         s_arcache, s_arlock, s_arprot,
 
-        s_awlen, s_awsize, s_awburst,
+        s_awsize, s_awburst,
 
         s_wstrb, s_wlast,
 
-        s_arlen, s_arsize, s_arburst
+        s_arsize, s_arburst
 
     };
 
+    // synopsys translate_off
+    // Simulation-only: verify master/environment meets module assumptions.
+    reg [4:0] sim_w_beats_left;
 
+    always @(posedge aclk or negedge aresetn) begin
+        if (!aresetn) begin
+            sim_w_beats_left <= 5'd0;
+        end else begin
+            if (aw_take) begin
+                if (s_awsize !== 3'b010)
+                    $error("%m: axi3_to_ahblite: AWSIZE must be 32-bit word (3'b010), got %b", s_awsize);
+                if (s_awlock !== 2'b00)
+                    $error("%m: axi3_to_ahblite: AWLOCK must be normal (2'b00), got %b", s_awlock);
+                if (s_awaddr[1:0] !== 2'b00)
+                    $error("%m: axi3_to_ahblite: AWADDR must be word-aligned, got 0x%h", s_awaddr);
+                if (s_awlen > 4'd15)
+                    $error("%m: axi3_to_ahblite: AWLEN exceeds AXI3 maximum (15)");
+                if ((s_awlen != 4'd0) && (s_awburst !== 2'b01))
+                    $error("%m: axi3_to_ahblite: multi-beat AW burst must be INCR (2'b01), got %b", s_awburst);
+                sim_w_beats_left <= s_awlen + 5'd1;
+            end
+
+            if (ar_take) begin
+                if (s_arsize !== 3'b010)
+                    $error("%m: axi3_to_ahblite: ARSIZE must be 32-bit word (3'b010), got %b", s_arsize);
+                if (s_arlock !== 2'b00)
+                    $error("%m: axi3_to_ahblite: ARLOCK must be normal (2'b00), got %b", s_arlock);
+                if (s_araddr[1:0] !== 2'b00)
+                    $error("%m: axi3_to_ahblite: ARADDR must be word-aligned, got 0x%h", s_araddr);
+                if (s_arlen > 4'd15)
+                    $error("%m: axi3_to_ahblite: ARLEN exceeds AXI3 maximum (15)");
+                if ((s_arlen != 4'd0) && (s_arburst !== 2'b01))
+                    $error("%m: axi3_to_ahblite: multi-beat AR burst must be INCR (2'b01), got %b", s_arburst);
+            end
+
+            if (aw_take && ar_take)
+                $error("%m: axi3_to_ahblite: AW and AR must not handshake in the same cycle");
+
+            if (s_wvalid && !wr_active)
+                $error("%m: axi3_to_ahblite: WVALID asserted outside active write burst");
+
+            if (w_take) begin
+                if (s_wstrb !== 4'b1111)
+                    $error("%m: axi3_to_ahblite: WSTRB must be full word (4'b1111), got %b", s_wstrb);
+                if (wr_addr_q[1:0] !== 2'b00)
+                    $error("%m: axi3_to_ahblite: write beat address must stay word-aligned, got 0x%h", wr_addr_q);
+                if (sim_w_beats_left == 5'd0)
+                    $error("%m: axi3_to_ahblite: unexpected W beat (no beats remaining)");
+                if ((sim_w_beats_left == 5'd1) && !s_wlast)
+                    $error("%m: axi3_to_ahblite: WLAST required on final W beat");
+                if ((sim_w_beats_left != 5'd1) && s_wlast)
+                    $error("%m: axi3_to_ahblite: WLAST must only assert on final W beat");
+                sim_w_beats_left <= sim_w_beats_left - 5'd1;
+            end
+
+            if (s_arvalid && s_arready && rd_active && (rd_pop_beats_q != rd_total_beats_q))
+                $error("%m: axi3_to_ahblite: new AR before prior read burst R data fully returned");
+        end
+    end
+    // synopsys translate_on
 
 endmodule
 
