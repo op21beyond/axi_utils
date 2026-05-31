@@ -171,6 +171,9 @@ module axi3_to_ahblite #(
 
     localparam [1:0] AHB_NONSEQ = 2'b10;
 
+    // Word-aligned burst stride (32-bit data path by design contract)
+    localparam [ADDR_WIDTH-1:0] BEAT_ADDR_INCR = 32'd4;
+
 
 
     reg [ADDR_WIDTH-1:0]   wr_addr_fifo  [0:WR_CMD_DEPTH-1];
@@ -446,7 +449,7 @@ module axi3_to_ahblite #(
 
                 wr_wr_ptr <= (wr_wr_ptr == WR_CMD_DEPTH-1) ? {WR_PTR_W{1'b0}} : (wr_wr_ptr + 1'b1);
 
-                wr_addr_q <= wr_addr_q + ADDR_WIDTH'd4;
+                wr_addr_q <= wr_addr_q + BEAT_ADDR_INCR;
 
                 wr_beats_left_q <= wr_beats_left_q - 5'd1;
 
@@ -486,7 +489,7 @@ module axi3_to_ahblite #(
 
                 rd_wr_ptr <= (rd_wr_ptr == RD_CMD_DEPTH-1) ? {RD_PTR_W{1'b0}} : (rd_wr_ptr + 1'b1);
 
-                rd_addr_q <= rd_addr_q + ADDR_WIDTH'd4;
+                rd_addr_q <= rd_addr_q + BEAT_ADDR_INCR;
 
                 rd_beats_left_q <= rd_beats_left_q - 5'd1;
 
