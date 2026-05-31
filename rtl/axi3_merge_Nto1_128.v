@@ -153,6 +153,7 @@ module axi3_merge_Nto1_128 #(
 
     integer k;
     integer idx;
+    integer fi;
 
     always @(*) begin
         aw_grant_v = 1'b0;
@@ -244,6 +245,9 @@ module axi3_merge_Nto1_128 #(
             w_wr_ptr <= {W_PTR_W{1'b0}};
             w_rd_ptr <= {W_PTR_W{1'b0}};
             w_count  <= {(W_PTR_W+1){1'b0}};
+            for (fi = 0; fi < WR_OUTSTANDING_DEPTH; fi = fi + 1) begin
+                w_sel_fifo[fi] <= {SRC_W{1'b0}};
+            end
         end else begin
             if (aw_hs) begin
                 w_sel_fifo[w_wr_ptr] <= aw_grant_i;

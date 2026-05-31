@@ -159,6 +159,8 @@ module axi3_router_1toN #(
     wire w_last_hs = w_hs && s_wlast;
     wire b_push    = w_last_hs && !w_fifo_empty && !b_fifo_full;
 
+    integer fi;
+
     wire [SEL_W-1:0] w_cur_sel = w_sel_fifo[w_rd_ptr];
     wire [SEL_W-1:0] b_cur_sel = b_sel_fifo[b_rd_ptr];
     wire [SEL_W-1:0] r_cur_sel = r_sel_fifo[r_rd_ptr];
@@ -224,6 +226,13 @@ module axi3_router_1toN #(
             w_count  <= {(PTR_W+1){1'b0}};
             b_count  <= {(PTR_W+1){1'b0}};
             r_count  <= {(PTR_W+1){1'b0}};
+            for (fi = 0; fi < OUTSTANDING_DEPTH; fi = fi + 1) begin
+                w_sel_fifo[fi] <= {SEL_W{1'b0}};
+                b_sel_fifo[fi] <= {SEL_W{1'b0}};
+                b_id_fifo[fi]  <= {ID_WIDTH{1'b0}};
+                r_sel_fifo[fi] <= {SEL_W{1'b0}};
+                r_id_fifo[fi]  <= {ID_WIDTH{1'b0}};
+            end
         end else begin
             if (aw_hs) begin
                 w_sel_fifo[w_wr_ptr] <= aw_sel_idx;

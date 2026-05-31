@@ -206,7 +206,7 @@ module axi3_to_ahblite #(
 
     reg                    b_pending;
 
-
+    integer                fi;
 
     reg                    pend_valid;
 
@@ -370,6 +370,18 @@ module axi3_to_ahblite #(
 
 
             rr_q <= 1'b0;
+
+            for (fi = 0; fi < WR_CMD_DEPTH; fi = fi + 1) begin
+                wr_addr_fifo[fi] <= {ADDR_WIDTH{1'b0}};
+                wr_data_fifo[fi] <= 32'd0;
+            end
+            for (fi = 0; fi < RD_CMD_DEPTH; fi = fi + 1) begin
+                rd_addr_fifo[fi] <= {ADDR_WIDTH{1'b0}};
+            end
+            for (fi = 0; fi < RESP_DEPTH; fi = fi + 1) begin
+                rdata_fifo[fi] <= 32'd0;
+                rlast_fifo[fi] <= 1'b0;
+            end
 
 
 
