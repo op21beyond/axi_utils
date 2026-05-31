@@ -131,12 +131,12 @@ module axi3_merge_Nto1_128 #(
     wire w_fifo_empty = (w_count == 0);
     wire w_fifo_full  = (w_count == WR_OUTSTANDING_DEPTH);
 
-    wire             aw_grant_v;
-    wire [SRC_W-1:0] aw_grant_i;
+    reg              aw_grant_v;
+    reg [SRC_W-1:0]  aw_grant_i;
     wire             w_grant_v;
     wire [SRC_W-1:0] w_grant_i;
-    wire             ar_grant_v;
-    wire [SRC_W-1:0] ar_grant_i;
+    reg              ar_grant_v;
+    reg [SRC_W-1:0]  ar_grant_i;
 
     wire aw_hs     = aw_grant_v && m_awready && !w_fifo_full;
     wire w_hs      = w_grant_v && m_wready;

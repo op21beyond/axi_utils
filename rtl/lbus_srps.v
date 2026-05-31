@@ -239,6 +239,11 @@ module lbus_srps #(
     localparam integer BYPASS_IDX         = SEXTMEM_PORT_NUM - 1; // msrp[8] bypass -> sextmem[BYPASS_IDX]
     localparam integer SEXTMEM_ID_PAD_W   = SEXTMEM_ID_WIDTH - MEM_MERGE_ID_W; // zero-pad to SEXTMEM_ID_WIDTH
     localparam integer SEXTMEM_BYPASS_PAD_W = SEXTMEM_ID_WIDTH - MSRP_ID_WIDTH; // msrp[8] bypass -> sextmem[BYPASS_IDX]
+    localparam integer MEXT_AW_P = MEXT_ID_WIDTH + ADDR_WIDTH_S + 4 + 3 + 2 + 2 + 4 + 3;
+    localparam integer MEXT_AR_P = MEXT_ID_WIDTH + ADDR_WIDTH_S + 4 + 3 + 2 + 2 + 4 + 3;
+    localparam integer MEXT_W_P  = MEXT_ID_WIDTH + 32 + 4 + 1;
+    localparam integer MEXT_B_P  = MEXT_ID_WIDTH + 2;
+    localparam integer MEXT_R_P  = MEXT_ID_WIDTH + 32 + 2 + 1;
 
     // Router master target0/target1 arrays
     wire [8:0]                   rt0_awvalid;
@@ -550,7 +555,7 @@ module lbus_srps #(
     genvar mi;
     generate
         for (mi = 0; mi < NUM_MEM_MERGE; mi = mi + 1) begin : g_mem_merge
-            localparam integer RT_LO = mi * MEM_MERGE_N;
+            localparam RT_LO = mi * MEM_MERGE_N;
 
             wire [MEM_MERGE_N-1:0]                   mem_s_awvalid;
             wire [MEM_MERGE_N-1:0]                   mem_s_awready;
@@ -707,17 +712,6 @@ module lbus_srps #(
                 .m_rdata(mem_m_rdata), .m_rresp(mem_m_rresp), .m_rlast(mem_m_rlast)
             );
 
-            generate
-                if (SEXTMEM_ID_PAD_W > 0) begin : gen_id_pad
-                    assign mem_m_awid_z = {{SEXTMEM_ID_PAD_W{1'b0}}, mem_m_awid};
-                    assign mem_m_wid_z  = {{SEXTMEM_ID_PAD_W{1'b0}}, mem_m_wid};
-                    assign mem_m_arid_z = {{SEXTMEM_ID_PAD_W{1'b0}}, mem_m_arid};
-                end else begin : gen_id_nopad
-                    assign mem_m_awid_z = mem_m_awid;
-                    assign mem_m_wid_z  = mem_m_wid;
-                    assign mem_m_arid_z = mem_m_arid;
-                end
-            endgenerate
             assign mem_m_bid    = mem_m_bid_z[MEM_MERGE_ID_W-1:0];
             assign mem_m_rid    = mem_m_rid_z[MEM_MERGE_ID_W-1:0];
 
@@ -775,6 +769,26 @@ module lbus_srps #(
                 .rid_m(mem_m_rid_z), .rdata_m(mem_m_rdata), .rresp_m(mem_m_rresp),
                 .rlast_m(mem_m_rlast)
             );
+        end
+    endgenerate
+
+    // ID zero-pad: sibling generate (no nesting inside g_mem_merge — xrun-safe)
+    generate
+        if (SEXTMEM_ID_PAD_W > 0) begin : g_mem_id_pad
+            for (mi = 0; mi < NUM_MEM_MERGE; mi = mi + 1) begin
+                assign g_mem_merge[mi].mem_m_awid_z =
+                    {{SEXTMEM_ID_PAD_W{1'b0}}, g_mem_merge[mi].mem_m_awid};
+                assign g_mem_merge[mi].mem_m_wid_z  =
+                    {{SEXTMEM_ID_PAD_W{1'b0}}, g_mem_merge[mi].mem_m_wid};
+                assign g_mem_merge[mi].mem_m_arid_z =
+                    {{SEXTMEM_ID_PAD_W{1'b0}}, g_mem_merge[mi].mem_m_arid};
+            end
+        end else begin : g_mem_id_nopad
+            for (mi = 0; mi < NUM_MEM_MERGE; mi = mi + 1) begin
+                assign g_mem_merge[mi].mem_m_awid_z = g_mem_merge[mi].mem_m_awid;
+                assign g_mem_merge[mi].mem_m_wid_z  = g_mem_merge[mi].mem_m_wid;
+                assign g_mem_merge[mi].mem_m_arid_z = g_mem_merge[mi].mem_m_arid;
+            end
         end
     endgenerate
 
@@ -974,12 +988,6 @@ module lbus_srps #(
     wire [NUM_SRP-1:0] mext_rt_aw_sel, mext_rt_ar_sel;
     wire [ADDR_WIDTH_S-1:0] mext_awaddr_map, mext_araddr_map;
     wire [ADDR_WIDTH_S-1:0] mext_rt_awaddr_tgt, mext_rt_araddr_tgt;
-
-    localparam integer MEXT_AW_P = MEXT_ID_WIDTH + ADDR_WIDTH_S + 4 + 3 + 2 + 2 + 4 + 3;
-    localparam integer MEXT_AR_P = MEXT_ID_WIDTH + ADDR_WIDTH_S + 4 + 3 + 2 + 2 + 4 + 3;
-    localparam integer MEXT_W_P  = MEXT_ID_WIDTH + 32 + 4 + 1;
-    localparam integer MEXT_B_P  = MEXT_ID_WIDTH + 2;
-    localparam integer MEXT_R_P  = MEXT_ID_WIDTH + 32 + 2 + 1;
 
     wire [MEXT_AW_P-1:0] mext_aw_pld_s, mext_aw_pld_m;
     wire [MEXT_W_P-1:0]  mext_w_pld_s,  mext_w_pld_m;
