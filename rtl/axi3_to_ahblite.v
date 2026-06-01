@@ -1,7 +1,7 @@
 // -----------------------------------------------------------------------------
 // Module      : axi3_to_ahblite
 // Date        : 2026-05-27
-// Version     : v1.1.0
+// Version     : v1.2.0
 // Author      : Jongchul Shin
 // Function    : AXI3 (no ID) to AHB-Lite bridge.
 //               AXI bursts are decomposed into pipelined AHB single transfers.
@@ -9,9 +9,11 @@
 // Assumptions : Fixed 32-bit data bus (WORD-only accesses by system contract).
 //               Size/align/fixed/wstrb checks are not enforced in logic.
 //               No LOCK/EXCLUSIVE behavior. ERROR response mapped to OKAY.
-// Notes       : AHB outputs SINGLE transfers only (hburst=000; htrans=IDLE/NONSEQ).
+// Notes       : AHB outputs SINGLE transfers only (hburst=000; htrans=IDLE/NONSEQ/SEQ).
 //               Split-ready slaves: address-phase hready starts the beat; data-phase
-//               hready completes it (ahb_data_pend). AXI cache/lock/prot not used.
+//               hready completes it (ahb_data_pend). One address phase (total_beats==1):
+//               htrans IDLE after addr ack; multiple beats: NONSEQ then SEQ until last
+//               addr ack, then IDLE until data. AXI cache/lock/prot not used.
 // -----------------------------------------------------------------------------
 module axi3_to_ahblite #(
     parameter integer ADDR_WIDTH = 32,                // Address bus width
@@ -84,6 +86,7 @@ module axi3_to_ahblite #(
                                     (RESP_DEPTH <= 8) ? 3 :
                                     (RESP_DEPTH <= 16) ? 4 : 5;
     localparam [1:0] AHB_IDLE   = 2'b00;
+    localparam [1:0] AHB_SEQ    = 2'b11;
     localparam [1:0] AHB_NONSEQ = 2'b10;
     // Word-aligned burst stride (32-bit data path by design contract)
     localparam [ADDR_WIDTH-1:0] BEAT_ADDR_INCR = 32'd4;
@@ -142,6 +145,18 @@ module axi3_to_ahblite #(
     wire both_valid  = wr_issue_valid && rd_issue_valid;
     wire issue_wr    = issue && choose_wr;
     wire issue_rd    = issue && choose_rd;
+
+    // htrans: one address phase (total_beats==1) -> IDLE after addr ack; else SEQ until last addr
+    wire [4:0] pend_beat_idx   = pend_write ? wr_done_beats_q : rd_done_beats_q;
+    wire [4:0] pend_total_beats = pend_write ? wr_total_beats_q : rd_total_beats_q;
+    wire       one_addr_phase  = (pend_total_beats == 5'd1);
+    wire       last_addr_phase = (pend_beat_idx == (pend_total_beats - 5'd1));
+    wire [1:0] htrans_nxt;
+    assign htrans_nxt =
+        issue_wr ? ((wr_done_beats_q == 5'd0) ? AHB_NONSEQ : AHB_SEQ) :
+        issue_rd ? ((rd_done_beats_q == 5'd0) ? AHB_NONSEQ : AHB_SEQ) :
+        ahb_data_pend ? ((one_addr_phase || last_addr_phase) ? AHB_IDLE : AHB_SEQ) :
+        AHB_IDLE;
 
     wire b_take = s_bvalid && s_bready;
     wire r_take = s_rvalid && s_rready;
@@ -304,7 +319,6 @@ module axi3_to_ahblite #(
                     hwrite <= 1'b1;
                     hsize  <= 3'b010; // word only by design assumption
                     hburst <= 3'b000; // AHB single only
-                    htrans <= AHB_NONSEQ;
                     wr_data_pend <= wr_data_fifo[wr_rd_ptr];
                     hwdata       <= wr_data_fifo[wr_rd_ptr];
                 end else if (issue_rd) begin
@@ -312,14 +326,14 @@ module axi3_to_ahblite #(
                     hwrite <= 1'b0;
                     hsize  <= 3'b010;
                     hburst <= 3'b000;
-                    htrans <= AHB_NONSEQ;
                 end else if (ahb_idle) begin
                     hwrite <= 1'b0;
                     hsize  <= 3'b010;
                     hburst <= 3'b000;
-                    htrans <= AHB_IDLE;
                 end
             end
+
+            htrans <= htrans_nxt;
         end
     end
 
