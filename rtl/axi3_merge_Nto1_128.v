@@ -151,21 +151,23 @@ module axi3_merge_Nto1_128 #(
     wire [IN_ID_WIDTH-1:0] w_id_in  = s_wid[(w_grant_i*IN_ID_WIDTH) +: IN_ID_WIDTH];
     wire [IN_ID_WIDTH-1:0] ar_id_in = s_arid[(ar_grant_i*IN_ID_WIDTH) +: IN_ID_WIDTH];
 
-    integer k;
-    integer idx;
+    integer aw_k;
+    integer aw_idx;
+    integer ar_k;
+    integer ar_idx;
     integer fi;
 
     always @(*) begin
         aw_grant_v = 1'b0;
         aw_grant_i = {SRC_W{1'b0}};
-        for (k = 0; k < N; k = k + 1) begin
-            idx = rr_aw_q + k;
-            if (idx >= N) begin
-                idx = idx - N;
+        for (aw_k = 0; aw_k < N; aw_k = aw_k + 1) begin
+            aw_idx = rr_aw_q + aw_k;
+            if (aw_idx >= N) begin
+                aw_idx = aw_idx - N;
             end
-            if (!aw_grant_v && s_awvalid[idx]) begin
+            if (!aw_grant_v && s_awvalid[aw_idx]) begin
                 aw_grant_v = 1'b1;
-                aw_grant_i = idx[SRC_W-1:0];
+                aw_grant_i = aw_idx[SRC_W-1:0];
             end
         end
     end
@@ -176,14 +178,14 @@ module axi3_merge_Nto1_128 #(
     always @(*) begin
         ar_grant_v = 1'b0;
         ar_grant_i = {SRC_W{1'b0}};
-        for (k = 0; k < N; k = k + 1) begin
-            idx = rr_ar_q + k;
-            if (idx >= N) begin
-                idx = idx - N;
+        for (ar_k = 0; ar_k < N; ar_k = ar_k + 1) begin
+            ar_idx = rr_ar_q + ar_k;
+            if (ar_idx >= N) begin
+                ar_idx = ar_idx - N;
             end
-            if (!ar_grant_v && s_arvalid[idx]) begin
+            if (!ar_grant_v && s_arvalid[ar_idx]) begin
                 ar_grant_v = 1'b1;
-                ar_grant_i = idx[SRC_W-1:0];
+                ar_grant_i = ar_idx[SRC_W-1:0];
             end
         end
     end

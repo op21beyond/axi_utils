@@ -292,15 +292,16 @@ module axi3_router_1toN #(
     // synopsys translate_off
     // Simulation-only: aw_sel/ar_sel must be one-hot when valid is asserted.
     always @(posedge aclk or negedge aresetn) begin
-        integer sel_k;
+        integer aw_sel_k;
+        integer ar_sel_k;
         integer aw_sel_cnt;
         integer ar_sel_cnt;
 
         if (aresetn) begin
             if (s_awvalid) begin
                 aw_sel_cnt = 0;
-                for (sel_k = 0; sel_k < N; sel_k = sel_k + 1) begin
-                    if (aw_sel[sel_k])
+                for (aw_sel_k = 0; aw_sel_k < N; aw_sel_k = aw_sel_k + 1) begin
+                    if (aw_sel[aw_sel_k])
                         aw_sel_cnt = aw_sel_cnt + 1;
                 end
                 if (aw_sel_cnt != 1)
@@ -309,8 +310,8 @@ module axi3_router_1toN #(
 
             if (s_arvalid) begin
                 ar_sel_cnt = 0;
-                for (sel_k = 0; sel_k < N; sel_k = sel_k + 1) begin
-                    if (ar_sel[sel_k])
+                for (ar_sel_k = 0; ar_sel_k < N; ar_sel_k = ar_sel_k + 1) begin
+                    if (ar_sel[ar_sel_k])
                         ar_sel_cnt = ar_sel_cnt + 1;
                 end
                 if (ar_sel_cnt != 1)

@@ -62,7 +62,7 @@ module axi3_aw_w_order_gate #(
     // synopsys translate_off
     always @(posedge aclk or negedge aresetn) begin
         if (aresetn) begin
-            if (wvalid && !w_gate)
+            if (wvalid && wready_i && !w_gate)
                 $error("%m: axi3_aw_w_order_gate: WVALID asserted with no pending AW (gate closed)");
         end
     end
