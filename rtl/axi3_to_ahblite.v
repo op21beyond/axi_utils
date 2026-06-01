@@ -1,7 +1,7 @@
 // -----------------------------------------------------------------------------
 // Module      : axi3_to_ahblite
 // Date        : 2026-05-27
-// Version     : v1.2.0
+// Version     : v1.2.1
 // Author      : Jongchul Shin
 // Function    : AXI3 (no ID) to AHB-Lite bridge.
 //               AXI bursts are decomposed into pipelined AHB single transfers.
@@ -11,7 +11,8 @@
 //               No LOCK/EXCLUSIVE behavior. ERROR response mapped to OKAY.
 // Notes       : AHB outputs SINGLE transfers only (hburst=000; htrans=IDLE/NONSEQ/SEQ).
 //               Split-ready slaves: address-phase hready starts the beat; data-phase
-//               hready completes it (ahb_data_pend). One address phase (total_beats==1):
+//               hready completes it (ahb_data_pend; ahb_wait_data skips addr-phase hready).
+//               One address phase (total_beats==1):
 //               htrans IDLE after addr ack; multiple beats: NONSEQ then SEQ until last
 //               addr ack, then IDLE until data. AXI cache/lock/prot not used.
 // -----------------------------------------------------------------------------
@@ -104,7 +105,8 @@ module axi3_to_ahblite #(
     reg [RESP_PTR_W:0]     r_count;
     reg                    b_pending;
     integer                fi;
-    reg                    ahb_data_pend; // 1: address accepted, waiting for data-phase hready
+    reg                    ahb_data_pend; // 1: beat started (addr issued), waiting for data-phase hready
+    reg                    ahb_wait_data; // 1: block complete until addr-phase hready(s) done
     reg                    pend_write;
     reg                    pend_rlast;
     reg [31:0]             wr_data_pend;
@@ -136,7 +138,8 @@ module axi3_to_ahblite #(
     wire choose_wr = wr_issue_valid && (!rd_issue_valid || !rr_q);
     wire choose_rd = rd_issue_valid && (!wr_issue_valid || rr_q);
     wire ahb_idle    = !ahb_data_pend;
-    wire complete_data  = ahb_data_pend && hready;
+    // complete only after issue cycle; first hready(s) clear ahb_wait_data (addr phase)
+    wire complete_data  = ahb_data_pend && hready && !ahb_wait_data;
     wire complete_write = complete_data && pend_write;
     wire complete_read  = complete_data && !pend_write;
     // New beat: address-phase hready while bus idle, or back-to-back on data-phase hready
@@ -185,6 +188,7 @@ module axi3_to_ahblite #(
             r_count  <= {(RESP_PTR_W+1){1'b0}};
             b_pending <= 1'b0;
             ahb_data_pend <= 1'b0;
+            ahb_wait_data <= 1'b0;
             pend_write <= 1'b0;
             pend_rlast <= 1'b0;
             rr_q <= 1'b0;
@@ -273,6 +277,9 @@ module axi3_to_ahblite #(
                 2'b01: rd_count <= rd_count - 1'b1;
                 default: rd_count <= rd_count;
             endcase
+            if (hready && ahb_data_pend && ahb_wait_data) begin
+                ahb_wait_data <= 1'b0;
+            end
             if (complete_data) begin
                 ahb_data_pend <= 1'b0;
             end
@@ -304,6 +311,7 @@ module axi3_to_ahblite #(
             endcase
             if (issue) begin
                 ahb_data_pend <= 1'b1;
+                ahb_wait_data <= 1'b1;
                 if (issue_wr) begin
                     pend_write <= 1'b1;
                     pend_rlast <= 1'b0;
